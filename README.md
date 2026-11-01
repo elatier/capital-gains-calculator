@@ -94,7 +94,7 @@ apt install texlive-latex-base
   tax year 2020/21:
 
 ```shell
-cgt-calc --year 2020 --schwab-file schwab_transactions.csv --trading212-dir trading212/ --mssb-dir mmsb_report/
+cgt-calc --year 2020 --schwab schwab_transactions.csv --trading212-dir trading212/ --mssb-dir mmsb_report/
 ```
 
 - Run `cgt-calc --help` for all available options.
@@ -120,7 +120,7 @@ You will need:
 Example usage for the tax year 2020/21:
 
 ```shell
-cgt-calc --year 2020 --schwab-file schwab_transactions.csv --schwab-award-file schwab_awards.csv
+cgt-calc --year 2020 --schwab schwab_transactions.csv --schwab-award schwab_awards.csv
 ```
 
 _Note: For historic reasons, it is possible to provide the Equity Awards history in JSON format with
@@ -224,6 +224,23 @@ Example usage for the tax year 2024/25:
 
 ```shell
 cgt-calc --year 2024 --freetrade-file freetrade_GIA.csv
+```
+
+</details>
+ <br />
+ <details>
+    <summary>🏦 Instructions for Interactive Brokers (IBKR)</summary>
+
+You will need:
+
+- **Exported transaction history from Interactive Brokers.** From web, go to **Performance & Reports
+  → Transaction History**. Select a period since creation of the account and click the export CSV
+  icon. [See example](tests/interactive_brokers/data/test_basic.csv).
+
+Example usage for the tax year 2025/26:
+
+```shell
+cgt-calc --year 2025 --interactive-brokers-file U000000-TRANSACTIONS.csv
 ```
 
 </details>

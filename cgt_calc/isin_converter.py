@@ -9,7 +9,9 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from requests_ratelimiter import LimiterSession
+from pyrate_limiter import limiter_factory
+from pyrate_limiter.abstracts.rate import Duration
+from pyrate_limiter.extras.requests_limiter import RateLimitedRequestsSession
 
 from .const import CGT_TEST_MODE, INITIAL_ISIN_TRANSLATION_RESOURCE
 from .exceptions import (
@@ -62,7 +64,10 @@ class IsinConverter:
     ):
         """Create the IsinConverter."""
         # https://www.openfigi.com/api/documentation#rate-limits
-        self.session = LimiterSession(per_minute=24)
+        limiter = limiter_factory.create_inmemory_limiter(
+            rate_per_duration=24, duration=Duration.MINUTE
+        )
+        self.session = RateLimitedRequestsSession(limiter)
         self.isin_translation_file = isin_translation_file
         self.data: dict[str, set[str]] = {}
         self.write_data: dict[str, set[str]] = {}
