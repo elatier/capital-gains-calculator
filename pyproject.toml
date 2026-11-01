@@ -1,19 +1,24 @@
 [build-system]
-requires = ["uv_build>=0.8.23,<0.11.0"]
+requires = ["uv_build>=0.13.0,<0.14.0"]
 build-backend = "uv_build"
 
 [project]
 name = "cgt-calc"
 version = "0.0.0"
-description = "Calculate UK capital gains tax from broker exports — supports Charles Schwab, Trading 212, Morgan Stanley, Sharesight, and Vanguard."
+description = "Calculate UK capital gains tax from broker exports for your HMRC Self Assessment"
 authors = [{ name = "Ruslan Sayfutdinov", email = "ruslan@sayfutdinov.com" }]
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 classifiers = [
-  "Development Status :: 4 - Beta",
-  "License :: OSI Approved :: MIT License",
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Office/Business :: Financial",
+  "Topic :: Office/Business :: Financial :: Investment",
   "Typing :: Typed",
 ]
 keywords = [
@@ -25,6 +30,7 @@ keywords = [
   "Trading 212",
   "Morgan Stanley",
   "Sharesight",
+  "Hargreaves Lansdown",
   "Vanguard",
   "broker export",
   "financial reporting",
@@ -34,323 +40,77 @@ dependencies = [
   "colorama>=0.4.6",
   "defusedxml>=0.7.1,<1.0.0",
   "Jinja2>=2.11.3,<4.0.0",
-  "pandas>=2.2",
+  "pandas>=3.1.0",
+  "pdfplumber>=0.11.9",
   "requests>=2.27.1",
-  "pyrate-limiter>=4.0.0",
-  "yfinance>=0.2.36",
+  "pyrate-limiter>=4.5.0",
+  "yfinance>=1.7.0",
+  "openpyxl>=3.1.5",
+  "xlrd>=2.0.2",
+  "shtab>=1.12.1",
+  # zoneinfo needs a tz database where the OS does not ship one.
+  "tzdata>=2026.5; sys_platform == 'win32' or sys_platform == 'emscripten'",
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/KapJI/capital-gains-calculator"
-"Repository" = "https://github.com/KapJI/capital-gains-calculator"
-"Bug Tracker" = "https://github.com/KapJI/capital-gains-calculator/issues"
-"Release Notes" = "https://github.com/KapJI/capital-gains-calculator/releases"
+"Homepage" = "https://cgt-calc.uk"
+"Repository" = "https://github.com/cgt-calc/capital-gains-calculator"
+"Bug Tracker" = "https://github.com/cgt-calc/capital-gains-calculator/issues"
+"Release Notes" = "https://github.com/cgt-calc/capital-gains-calculator/releases"
 
 [project.scripts]
-cgt-calc = "cgt_calc.main:init"
+cgt-calc = "cgt_calc.cli:init"
 
 [dependency-groups]
 dev = [
   "codespell>=2.4.1",
-  "dprint-py>=0.50.2.0",
-  "mypy>=1.18.2",
-  "pandas-stubs>=2.2",
-  "pylint>=3.3.8",
+  "dprint-py>=0.64.3.0",
+  "harper-cli>=2.12.0",
+  "mypy>=2.4.0",
+  "packaging>=26.3",
+  "pandas-stubs>=3.0.5.260914",
   "pytest>=8.4.2,<10.0.0",
   "pytest-clarity>=1.0.1",
-  "pytest-env>=1.1.5",
+  "pytest-cov>=7.0.0",
+  "pytest-env>=1.8.1",
   "pytest-xdist>=3.8.0",
-  "ruff>=0.13.3",
-  "types-colorama>=0.4.15.20250801",
-  "types-defusedxml>=0.7.0.20250822",
-  "types-python-dateutil>=2.9.0.20250822",
-  "types-requests>=2.32.4.20250913",
+  "reportlab>=5.0.1",
+  "ruff>=0.17.2",
+  "ty>=0.0.89,<0.1.0",
+  "types-colorama>=0.4.15.20260508",
+  "types-defusedxml>=0.7.0.20260504",
+  "types-python-dateutil>=2.9.0.20261021",
+  "types-reportlab>=5.0.0.20261008",
+  "types-requests>=2.33.0.20261006",
+]
+docs = [
+  "zensical>=0.0.71",
+]
+# Kept out of the dev group: the Linux wheel is large and only the link check
+# job needs it.
+links = [
+  "lychee-bin>=0.24.2",
 ]
 
 [tool.uv.build-backend]
 module-root = "."
-
-[tool.pylint.main]
-py-version = "3.12"
-load-plugins = [
-  "pylint.extensions.code_style",
-  "pylint.extensions.typing",
-]
-
-[tool.pylint.format]
-max-line-length = 88
-jobs = 2
-
-[tool.pylint.messages_control]
-# Reasons disabled:
-# duplicate-code - unavoidable
-# format - handled by ruff
-# invalid-unary-operand-type - buggy, mypy is enough. See PyCQA/pylint#1472
-# too-many-* - not enforced for the sake of readability
-# too-few-* - same as too-many-*
-# wrong-import-order - handled by ruff
-# ---
-# Pylint CodeStyle plugin
-# consider-using-namedtuple-or-dataclass - too opinionated
-# consider-using-assignment-expr - decision to use := better left to devs
-disable = [
-  "duplicate-code",
-  "format",
-  "invalid-unary-operand-type",
-  "too-few-public-methods",
-  "too-many-arguments",
-  "too-many-branches",
-  "too-many-instance-attributes",
-  "too-many-locals",
-  "too-many-positional-arguments",
-  "too-many-return-statements",
-  "too-many-statements",
-  "wrong-import-order",
-  "consider-using-namedtuple-or-dataclass",
-  "consider-using-assignment-expr",
-
-  # Handled by ruff
-  # Ref: <https://github.com/astral-sh/ruff/issues/970>
-  "await-outside-async", # PLE1142
-  "bad-str-strip-call", # PLE1310
-  "bad-string-format-type", # PLE1307
-  "bidirectional-unicode", # PLE2502
-  "continue-in-finally", # PLE0116
-  "duplicate-bases", # PLE0241
-  "misplaced-bare-raise", # PLE0704
-  "format-needs-mapping", # F502
-  "function-redefined", # F811
-  # Needed because ruff does not understand type of __all__ generated by a function
-  # "invalid-all-format", # PLE0605
-  "invalid-all-object", # PLE0604
-  "invalid-character-backspace", # PLE2510
-  "invalid-character-esc", # PLE2513
-  "invalid-character-nul", # PLE2514
-  "invalid-character-sub", # PLE2512
-  "invalid-character-zero-width-space", # PLE2515
-  "logging-too-few-args", # PLE1206
-  "logging-too-many-args", # PLE1205
-  "missing-format-string-key", # F524
-  "mixed-format-string", # F506
-  "no-method-argument", # N805
-  "no-self-argument", # N805
-  "nonexistent-operator", # B002
-  "nonlocal-without-binding", # PLE0117
-  "not-in-loop", # F701, F702
-  "notimplemented-raised", # F901
-  "return-in-init", # PLE0101
-  "return-outside-function", # F706
-  "syntax-error", # E999
-  "too-few-format-args", # F524
-  "too-many-format-args", # F522
-  "too-many-star-expressions", # F622
-  "truncated-format-string", # F501
-  "undefined-all-variable", # F822
-  "undefined-variable", # F821
-  "used-prior-global-declaration", # PLE0118
-  "yield-inside-async-function", # PLE1700
-  "yield-outside-function", # F704
-  "anomalous-backslash-in-string", # W605
-  "assert-on-string-literal", # PLW0129
-  "assert-on-tuple", # F631
-  "bad-format-string", # W1302, F
-  "bad-format-string-key", # W1300, F
-  "bare-except", # E722
-  "binary-op-exception", # PLW0711
-  "cell-var-from-loop", # B023
-  # "dangerous-default-value", # B006, ruff catches new occurrences, needs more work
-  "duplicate-except", # B014
-  "duplicate-key", # F601
-  "duplicate-string-formatting-argument", # F
-  "duplicate-value", # F
-  "eval-used", # S307
-  "exec-used", # S102
-  "expression-not-assigned", # B018
-  "f-string-without-interpolation", # F541
-  "forgotten-debug-statement", # T100
-  "format-string-without-interpolation", # F
-  # "global-statement", # PLW0603, ruff catches new occurrences, needs more work
-  "global-variable-not-assigned", # PLW0602
-  "implicit-str-concat", # ISC001
-  "import-outside-toplevel", # PLC0415
-  "import-self", # PLW0406
-  "inconsistent-quotes", # Q000
-  "invalid-envvar-default", # PLW1508
-  "keyword-arg-before-vararg", # B026
-  "logging-format-interpolation", # G
-  "logging-fstring-interpolation", # G
-  "logging-not-lazy", # G
-  "misplaced-future", # F404
-  "named-expr-without-context", # PLW0131
-  "nested-min-max", # PLW3301
-  "pointless-statement", # B018
-  "raise-missing-from", # B904
-  "redefined-builtin", # A001
-  "try-except-raise", # TRY302
-  "unused-argument", # ARG001, we don't use it
-  "unused-format-string-argument", # F507
-  "unused-format-string-key", # F504
-  "unused-import", # F401
-  "unused-variable", # F841
-  "useless-else-on-loop", # PLW0120
-  "wildcard-import", # F403
-  "bad-classmethod-argument", # N804
-  "consider-iterating-dictionary", # SIM118
-  "empty-docstring", # D419
-  "invalid-name", # N815
-  "line-too-long", # E501, disabled globally
-  "missing-class-docstring", # D101
-  "missing-final-newline", # W292
-  "missing-function-docstring", # D103
-  "missing-module-docstring", # D100
-  "multiple-imports", # E401
-  "singleton-comparison", # E711, E712
-  "subprocess-run-check", # PLW1510
-  "superfluous-parens", # UP034
-  "ungrouped-imports", # I001
-  "unidiomatic-typecheck", # E721
-  "unnecessary-direct-lambda-call", # PLC3002
-  "unnecessary-lambda-assignment", # PLC3001
-  "unnecessary-pass", # PIE790
-  "unneeded-not", # SIM208
-  "useless-import-alias", # PLC0414
-  "wrong-import-order", # I001
-  "wrong-import-position", # E402
-  "comparison-of-constants", # PLR0133
-  "comparison-with-itself", # PLR0124
-  "consider-alternative-union-syntax", # UP007
-  "consider-merging-isinstance", # PLR1701
-  "consider-using-alias", # UP006
-  "consider-using-dict-comprehension", # C402
-  "consider-using-generator", # C417
-  "consider-using-get", # SIM401
-  "consider-using-set-comprehension", # C401
-  "consider-using-sys-exit", # PLR1722
-  "consider-using-ternary", # SIM108
-  "literal-comparison", # F632
-  "property-with-parameters", # PLR0206
-  "super-with-arguments", # UP008
-  "too-many-branches", # PLR0912
-  "too-many-return-statements", # PLR0911
-  "too-many-statements", # PLR0915
-  "trailing-comma-tuple", # COM818
-  "unnecessary-comprehension", # C416
-  "use-a-generator", # C417
-  "use-dict-literal", # C406
-  "use-list-literal", # C405
-  "useless-object-inheritance", # UP004
-  "useless-return", # PLR1711
-  "no-else-break", # RET508
-  "no-else-continue", # RET507
-  "no-else-raise", # RET506
-  "no-else-return", # RET505
-  "broad-except", # BLE001
-  "protected-access", # SLF001
-  "broad-exception-raised", # TRY002
-  "consider-using-f-string", # PLC0209
-  # "no-self-use", # PLR6301  # Optional plugin, not enabled
-
-  # Handled by mypy
-  # Ref: <https://github.com/antonagestam/pylint-mypy-overlap>
-  "abstract-class-instantiated",
-  "arguments-differ",
-  "assigning-non-slot",
-  "assignment-from-no-return",
-  "assignment-from-none",
-  "bad-exception-cause",
-  "bad-format-character",
-  "bad-reversed-sequence",
-  "bad-super-call",
-  "bad-thread-instantiation",
-  "catching-non-exception",
-  "comparison-with-callable",
-  "deprecated-class",
-  "dict-iter-missing-items",
-  "format-combined-specification",
-  "global-variable-undefined",
-  "import-error",
-  "inconsistent-mro",
-  "inherit-non-class",
-  "init-is-generator",
-  "invalid-class-object",
-  "invalid-enum-extension",
-  "invalid-envvar-value",
-  "invalid-format-returned",
-  "invalid-hash-returned",
-  "invalid-metaclass",
-  "invalid-overridden-method",
-  "invalid-repr-returned",
-  "invalid-sequence-index",
-  "invalid-slice-index",
-  "invalid-slots-object",
-  "invalid-slots",
-  "invalid-star-assignment-target",
-  "invalid-str-returned",
-  "invalid-unary-operand-type",
-  "invalid-unicode-codec",
-  "isinstance-second-argument-not-valid-type",
-  "method-hidden",
-  "misplaced-format-function",
-  "missing-format-argument-key",
-  "missing-format-attribute",
-  "missing-kwoa",
-  "no-member",
-  "no-value-for-parameter",
-  "non-iterator-returned",
-  "non-str-assignment-to-dunder-name",
-  "nonlocal-and-global",
-  "not-a-mapping",
-  "not-an-iterable",
-  "not-async-context-manager",
-  "not-callable",
-  "not-context-manager",
-  "overridden-final-method",
-  "raising-bad-type",
-  "raising-non-exception",
-  "redundant-keyword-arg",
-  "relative-beyond-top-level",
-  "self-cls-assignment",
-  "signature-differs",
-  "star-needs-assignment-target",
-  "subclassed-final-class",
-  "super-without-brackets",
-  "too-many-function-args",
-  "typevar-double-variance",
-  "typevar-name-mismatch",
-  "unbalanced-dict-unpacking",
-  "unbalanced-tuple-unpacking",
-  "unexpected-keyword-arg",
-  "unhashable-member",
-  "unpacking-non-sequence",
-  "unsubscriptable-object",
-  "unsupported-assignment-operation",
-  "unsupported-binary-operation",
-  "unsupported-delete-operation",
-  "unsupported-membership-test",
-  "used-before-assignment",
-  "using-final-decorator-in-unsupported-version",
-  "wrong-exception-operation",
-]
-enable = [
-  "useless-suppression",
-  "use-symbolic-message-instead",
-]
-
-[tool.pylint.typing]
-runtime-typing = false
-
-[tool.pylint.code_style]
-max-line-length-suggestions = 72
 
 [tool.ruff]
 required-version = ">=0.13.0"
 target-version = "py312"
 
 [tool.ruff.lint]
+# Preview is on only to reach the individually selected preview rules below;
+# explicit-preview-rules keeps the rest off, though preview may still sharpen
+# what stable rules catch.
+preview = true
+explicit-preview-rules = true
 select = [
   "A", # flake8-builtins
+  "ARG", # flake8-unused-arguments
   "ASYNC", # flake8-async
   "B", # flake8-bugbear
+  "B909", # loop-iterator-mutation: mutating a collection while iterating it
   "BLE",
   "C", # complexity
   "COM", # flake8-commas
@@ -359,6 +119,7 @@ select = [
   "DTZ004", # Use datetime.fromtimestamp(ts, tz=) instead of datetime.utcfromtimestamp(ts)
   "E", # pycodestyle
   "F", # pyflakes
+  "FBT", # flake8-boolean-trap
   "FLY", # flynt
   "FURB", # refurb
   "G", # flake8-logging-format
@@ -368,16 +129,21 @@ select = [
   "ICN", # flake8-import-conventions
   "LOG", # flake8-logging
   "N", # pep8-naming
+  "PD", # pandas-vet
   "PERF", # Perflint
   "PGH", # pygrep-hooks
   "PIE", # flake8-pie
   "PL", # pylint
+  "PLR6201", # literal-membership: set literals for membership tests
+  "PLW1514", # unspecified-encoding: locale-dependent IO broke Windows once
+  "PLW1641", # eq-without-hash: __eq__ without __hash__ makes a class unhashable
   "PT", # flake8-pytest-style
   "PTH", # flake8-pathlib
   "PYI", # flake8-pyi
   "RET", # flake8-return
   "RSE", # flake8-raise
   "RUF", # Ruff-specific
+  "RUF031", # incorrectly-parenthesized-tuple-in-subscript
   "S102", # Use of exec detected
   "S103", # bad-file-permissions
   "S108", # hardcoded-temp-file
@@ -418,6 +184,7 @@ ignore = [
   "PLR0911", # Too many return statements ({returns} > {max_returns})
   "PLR0912", # Too many branches ({branches} > {max_branches})
   "PLR0913", # Too many arguments to function call ({c_args} > {max_args})
+  "PLR0917", # Too many positional arguments ({c_pos} > {max_pos})
   "PLR0915", # Too many statements ({statements} > {max_statements})
   "PLW2901", # Outer {outer_kind} variable {name} overwritten by inner {inner_kind} target
   "TRY003", # Avoid specifying long messages outside the exception class
@@ -437,7 +204,10 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["PLR2004"]
+# Test doubles intentionally mirror external library signatures (requests,
+# yfinance, ...), so unused arguments there are expected, not bugs. Likewise,
+# pytest parametrized cases routinely take boolean `expected` values (FBT).
+"tests/**" = ["PLR2004", "ARG", "FBT"]
 
 [tool.ruff.lint.isort]
 force-sort-within-sections = true
@@ -453,16 +223,32 @@ max-complexity = 25
 
 [tool.mypy]
 python_version = "3.12"
+num_workers = 4
 show_error_codes = true
 strict = true
 disallow_any_explicit = true
 disallow_any_unimported = true
 warn_no_return = true
 warn_unreachable = true
+enable_error_code = [
+  "deprecated",
+  "explicit-override",
+  "ignore-without-code",
+  "possibly-undefined",
+  "redundant-expr",
+  "redundant-self",
+  "truthy-iterable",
+]
+
+[tool.ty.environment]
+python-platform = "all"
+
+[tool.ty.rules]
+blanket-ignore-comment = "error"
 
 [tool.codespell]
 quiet-level = 2
-skip = "uv.lock,./.git/*,./.mypy_cache/*,./.pytest_cache/*,./.ruff_cache/*,./.venv/*,./dist/*,*.csv,./env/*,./out/*"
+skip = "uv.lock,./.git/*,./.mypy_cache/*,./.pytest_cache/*,./.ruff_cache/*,./.venv/*,./dist/*,*.csv,./env/*,./out/*,./site/*,./.wrangler/*"
 
 [tool.pytest.ini_options]
 addopts = "-vv -n auto"
@@ -471,4 +257,19 @@ env = [
 ]
 testpaths = [
   "tests",
+]
+
+[tool.coverage.run]
+branch = true
+# Measure CLI subprocesses spawned by the end-to-end tests too.
+patch = ["subprocess"]
+source = ["cgt_calc"]
+# Store relative paths so reports are portable outside the
+# environment that generated them.
+relative_files = true
+
+[tool.coverage.report]
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "raise AssertionError",
 ]

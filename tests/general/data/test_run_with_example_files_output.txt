@@ -1,46 +1,55 @@
-Parsing tests/schwab/data/schwab_transactions.csv...
-Parsing tests/trading212/data/2020/from_2020-09-11_to_2021-04-02.csv...
-Parsing tests/morgan_stanley/data/Releases Report.csv...
-Parsing tests/morgan_stanley/data/Withdrawals Report.csv...
-Found 27 broker transactions
-First pass completed
-Final portfolio:
+Final portfolio
+  GOOG: 163.20
+  NVDA: 1.00
   VNRG: 1.00
   VUAG: 30.50
-  NVDA: 1.00
-  GOOG: 163.20
-Final balance:
+
+Final balance
   Charles Schwab: 9479.30 (USD)
   Trading212: 33391.30 (GBP)
   Morgan Stanley: 1.00 (USD)
-Dividends:
-  NVDA: 0.10 (GBP)
-Interests:
-  Charles Schwab: 1.40 (USD)
-Disposal proceeds: £43836.90
 
-Second pass completed
-Portfolio at the end of 2020/2021 tax year:
-  VUAG: 30.50, £645.19
-  VNRG: 1.00, £8.98
+Dividends
+  NVDA: 0.11, excluding 0.01 taxed at source (GBP)
+
+Interest
+  Charles Schwab: 1.40 (USD)
+
+Portfolio at the end of 2020/2021 tax year
+  GOOG: 172.00, £12,516.55
   NVDA: 1.00, £401.01
-  GOOG: 172.00, £12516.55
-For tax year 2020/2021:
-Excess Reported Income:
+  VNRG: 1.00, £8.98
+  VUAG: 30.50, £645.19
+
+Tax summary for 2020/2021
+
+Capital gains
+  Disposals:                   4
+  Disposal proceeds:  £43,836.90
+  Allowable costs:    £18,666.33
+  Gain:               £25,170.57
+  Loss:                    £0.00
+  Total gain:         £25,170.57
+  Taxable gain:       £12,870.57
+  Tax at basic rate:   £1,287.06
+  Tax at higher rate:  £2,574.11
+Basic rate (10%): your taxable income for 2020/2021 plus the taxable gain is £37,500 or less.
+Higher rate (20%): your taxable income for 2020/2021 is £37,500 or more.
+If your taxable income is under £37,500 but the taxable gain takes you over it, you pay the basic rate on the part of it that fits under £37,500 and the higher rate on the rest. Your tax is then between the two figures.
+Taxable income is your income after the Personal Allowance and other Income Tax reliefs.
+To get a single figure, add --income with your income for 2020/2021 before the Personal Allowance, such as the pay on your P60. cgt-calc adds the dividends and interest in these files.
+The tax is an estimate: it leaves out gains that are not in the files you supplied, losses brought forward and reliefs. See https://cgt-calc.uk/tax-estimates/#what-the-estimates-leave-out
+
+Dividends
+  Proceeds:               £23.29
+  Tax-free allowance:  £2,000.00
+  Taxable proceeds:        £0.00
+
+Interest
+  UK proceeds:             £0.00
+  Foreign proceeds:        £1.03
+  Tax paid:                £0.00
+
+Excess Reported Income
   VUAG: £22.26 (included as dividend)
   VNRG: £0.91 (included as dividend)
-Number of disposals: 4
-Disposal proceeds: £43836.90
-Allowable costs: £18666.33
-Capital gain: £25170.57
-Capital loss: £0.00
-Total capital gain: £25170.57
-Taxable capital gain: £12870.57
-Total dividends proceeds: £23.27
-Total amount of dividends tax yearly allowance: £2000.00
-Total taxable dividends proceeds: £0.00
-Total UK interest proceeds: £0.00
-Total foreign interest proceeds: £1.03
-
-Generating PDF report...
-All done!

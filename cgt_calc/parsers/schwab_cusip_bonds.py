@@ -20,7 +20,8 @@ MAX_ACCRUED_INTEREST_BUY: Final = Decimal("0.01")
 MAX_ACCRUED_INTEREST_SELL: Final = Decimal(100)
 BOND_PRICE_TOLERANCE_RATIO: Final = Decimal("0.5")
 
-# Valid CUSIP characters for positions 7-8 (letters + special chars for fixed income)
+# Valid non-digit CUSIP characters (letters valid anywhere; *@# are specific to
+# fixed-income issues in positions 7-8)
 CUSIP_ALPHA_CHARS: Final = "ABCDEFGHIJKLMNOPQRSTUVWXYZ*@#"
 
 
@@ -162,8 +163,6 @@ def adjust_cusip_bond_price(
     if not _is_cusip_symbol(symbol) or price is None:
         return (price, fees)
 
-    # Mypy: at this point price is guaranteed to be non-None due to check above
-    assert price is not None
     adjusted_price = price / BOND_PRICE_DIVISOR
 
     # If we can't validate, apply adjustment anyway (trusted data)

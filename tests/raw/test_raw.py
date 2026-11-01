@@ -3,17 +3,29 @@
 from __future__ import annotations
 
 import csv
+import datetime as dt
 from decimal import Decimal
+import io
 import logging
 from pathlib import Path
+import re
 import subprocess
+import sys
 
 import pytest
 
+from cgt_calc.args_validators import STDIN_PATH
 from cgt_calc.exceptions import ParsingError
+from cgt_calc.logging import force_utf8_stdio
 from cgt_calc.model import ActionType
-from cgt_calc.parsers.raw import COLUMNS, RawColumn, RawParser, _parse_decimal
-from tests.utils import build_cmd
+from cgt_calc.parsers.raw import COLUMNS, RawParser
+from tests.utils import (
+    assert_stdout_matches,
+    build_cmd,
+    report_path,
+    run_cli,
+    stderr_alerts,
+)
 
 
 def _write_csv(path: Path, rows: list[list[str]]) -> None:
@@ -24,7 +36,7 @@ def _write_csv(path: Path, rows: list[list[str]]) -> None:
         writer.writerows(rows)
 
 
-def test_run_with_raw_files_no_balance_check() -> None:
+def test_run_with_raw_files_no_balance_check(request: pytest.FixtureRequest) -> None:
     """Runs the script and verifies it doesn't fail."""
     cmd = build_cmd(
         "--year",
@@ -32,61 +44,125 @@ def test_run_with_raw_files_no_balance_check() -> None:
         "--raw-file",
         "tests/raw/data/test_data.csv",
         "--no-balance-check",
+        "--output",
+        report_path(request),
     )
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode:
-        pytest.fail(
-            "Integration test failed\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
-    stderr_lines = result.stderr.strip().split("\n")
-    assert len(stderr_lines) == 1
-    assert stderr_lines[0].startswith("WARNING: Bed and breakfasting for META"), (
-        "Unexpected stderr message"
-    )
+    result = run_cli(cmd)
+    assert stderr_alerts(result.stderr) == [], "Unexpected stderr message"
     expected_file = Path("tests") / "raw" / "data" / "expected_output.txt"
-    expected = expected_file.read_text()
-    cmd_str = " ".join([param if param else "''" for param in cmd])
-    assert result.stdout == expected, (
-        "Run with example files generated unexpected outputs, "
-        "if you added new features update the test with:\n"
-        f"{cmd_str} > {expected_file}"
-    )
+    assert_stdout_matches(result, cmd, expected_file)
 
 
-def test_run_with_raw_files() -> None:
+def test_run_with_raw_files(request: pytest.FixtureRequest) -> None:
     """Runs the script and verifies it doesn't fail."""
     cmd = build_cmd(
         "--year",
         "2022",
         "--raw-file",
         "tests/raw/data/test_data_2.csv",
+        "--output",
+        report_path(request),
     )
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode:
-        pytest.fail(
-            "Integration test failed\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
-    stderr_lines = result.stderr.strip().split("\n")
-    assert len(stderr_lines) == 1
-    assert stderr_lines[0].startswith("WARNING: Bed and breakfasting for META"), (
-        "Unexpected stderr message"
-    )
+    result = run_cli(cmd)
+    assert stderr_alerts(result.stderr) == [], "Unexpected stderr message"
     expected_file = Path("tests") / "raw" / "data" / "expected_output_2.txt"
-    expected = expected_file.read_text()
-    cmd_str = " ".join([param if param else "''" for param in cmd])
-    assert result.stdout == expected, (
-        "Run with example files generated unexpected outputs, "
-        "if you added new features update the test with:\n"
-        f"{cmd_str} > {expected_file}"
+    assert_stdout_matches(result, cmd, expected_file)
+
+
+def test_run_with_raw_files_stdin(request: pytest.FixtureRequest) -> None:
+    """Runs the script with stdin and verifies it works identically."""
+    csv_file = Path("tests") / "raw" / "data" / "test_data.csv"
+    csv_content = csv_file.read_text(encoding="utf-8")
+
+    cmd = build_cmd(
+        "--year",
+        "2022",
+        "--raw-file",
+        "-",
+        "--no-balance-check",
+        "--output",
+        report_path(request),
     )
+    result = run_cli(cmd, stdin=csv_content)
+    assert stderr_alerts(result.stderr) == [], "Unexpected stderr message"
+    expected_file = Path("tests") / "raw" / "data" / "expected_output_stdin.txt"
+    assert_stdout_matches(result, cmd, expected_file, piped_from=csv_file)
 
 
-def test_read_raw_transactions_with_header(tmp_path: Path) -> None:
-    """Parse a RAW file including a header row."""
+MARKED_CSV = (
+    b"\xef\xbb\xbf"
+    b"date,action,symbol,quantity,price,fees,currency\n"
+    b"2023-02-09,DIVIDEND,OPRA,4200,0.80,0.0,USD\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("csv_bytes", "symbol"),
+    [
+        (
+            (
+                "date,action,symbol,quantity,price,fees,currency\n"
+                "2023-02-09,DIVIDEND,CAFÉ,4200,0.80,0.0,USD\n"
+            ).encode(),
+            "CAFÉ",
+        ),
+        (MARKED_CSV, "OPRA"),
+    ],
+    ids=["symbol outside ASCII", "byte-order mark"],
+)
+def test_stdin_decodes_utf8_under_a_legacy_locale(
+    monkeypatch: pytest.MonkeyPatch, csv_bytes: bytes, symbol: str
+) -> None:
+    """A UTF-8 export piped in keeps its characters on a legacy code page.
+
+    Windows decodes redirected stdin with the ANSI code page, so a symbol
+    outside ASCII would otherwise arrive as mojibake, and a leading
+    byte-order mark as stray characters in front of the first column name.
+    """
+    monkeypatch.setattr(
+        sys, "stdin", io.TextIOWrapper(io.BytesIO(csv_bytes), encoding="cp1252")
+    )
+    force_utf8_stdio()
+
+    transactions = RawParser.load_from_file(STDIN_PATH, show_parsing_msg=False)
+
+    assert [txn.symbol for txn in transactions] == [symbol]
+
+
+def test_a_byte_order_mark_is_not_read_as_data(tmp_path: Path) -> None:
+    """A file saved as Excel's "CSV UTF-8" starts with a mark, not a column."""
+    raw_file = tmp_path / "raw.csv"
+    raw_file.write_bytes(MARKED_CSV)
+
+    transactions = RawParser.load_from_file(raw_file, show_parsing_msg=False)
+
+    assert [txn.symbol for txn in transactions] == ["OPRA"]
+
+
+def test_run_with_nonexistent_file() -> None:
+    """Runs the script with a nonexistent file and verifies it fails with an error."""
+    missing_file = "tests/raw/data/does_not_exist.csv"
+    cmd = build_cmd(
+        "--year",
+        "2022",
+        "--raw-file",
+        missing_file,
+    )
+    result = subprocess.run(cmd, capture_output=True, encoding="utf-8", check=False)
+    assert result.returncode != 0
+    assert "path does not exist" in result.stderr
+    assert missing_file in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("fees", "expected_fees"),
+    [("0.10", Decimal("0.10")), ("", Decimal(0))],
+    ids=["stated", "blank"],
+)
+def test_read_raw_transactions_with_header(
+    tmp_path: Path, fees: str, expected_fees: Decimal
+) -> None:
+    """Parse a RAW file including a header row; a blank fee is no fee."""
 
     raw_file = tmp_path / "raw_with_header.csv"
     rows = [
@@ -97,7 +173,7 @@ def test_read_raw_transactions_with_header(tmp_path: Path) -> None:
             "XYZ",
             "10",
             "2.50",
-            "0.10",
+            fees,
             "USD",
         ],
     ]
@@ -111,8 +187,66 @@ def test_read_raw_transactions_with_header(tmp_path: Path) -> None:
     assert transaction.symbol == "XYZ"
     assert transaction.quantity == Decimal(10)
     assert transaction.price == Decimal("2.50")
-    assert transaction.amount == Decimal("-25.10")
-    assert transaction.fees == Decimal("0.10")
+    assert transaction.amount == -(Decimal("25.00") + expected_fees)
+    assert transaction.fees == expected_fees
+
+
+def test_read_raw_transactions_keep_their_row_and_order(tmp_path: Path) -> None:
+    """RAW rows keep the line they came from and the order they were read in.
+
+    A RAW file has dates and no times, so the order of its rows is the only
+    statement it makes about what happened first on a day. It is preserved
+    here rather than re-derived later from the merged, re-sorted stream.
+    """
+
+    raw_file = tmp_path / "raw_ordered.csv"
+    rows = [
+        COLUMNS,
+        ["2024-01-02", "BUY", "XYZ", "10", "2.50", "0.00", "USD"],
+        ["2024-01-02", "BUY", "XYZ", "5", "3.00", "0.00", "USD"],
+    ]
+    _write_csv(raw_file, rows)
+
+    transactions = RawParser().load_from_file(raw_file)
+
+    sources = [transaction.source for transaction in transactions]
+    assert all(source is not None for source in sources)
+    assert [source.row for source in sources if source] == [2, 3]
+    assert [source.index for source in sources if source] == [0, 1]
+    assert [source.file for source in sources if source] == [raw_file, raw_file]
+    assert [source.parser for source in sources if source] == ["RAW format"] * 2
+    # A RAW export states no times, so nothing may later read one from it.
+    assert [source.timestamp for source in sources if source] == [None, None]
+    # The order above is a statement about what happened first, because the
+    # format asks the user to write a day's rows in the order they happened.
+    assert [source.rows_in_time_order for source in sources if source] == [True] * 2
+
+
+def test_read_raw_transactions_transfer_to_spouse(tmp_path: Path) -> None:
+    """Parse a RAW TRANSFER_TO_SPOUSE row (no gain/no loss share transfer)."""
+
+    raw_file = tmp_path / "raw_transfer_to_spouse.csv"
+    rows = [
+        COLUMNS,
+        [
+            "2024-03-16",
+            "TRANSFER_TO_SPOUSE",
+            "XYZ",
+            "21.5",
+            "0.00",
+            "0.00",
+            "USD",
+        ],
+    ]
+    _write_csv(raw_file, rows)
+
+    transactions = RawParser().load_from_file(raw_file)
+
+    assert len(transactions) == 1
+    transaction = transactions[0]
+    assert transaction.action == ActionType.TRANSFER_TO_SPOUSE
+    assert transaction.symbol == "XYZ"
+    assert transaction.quantity == Decimal("21.5")
 
 
 def test_read_raw_transactions_without_header(
@@ -184,11 +318,217 @@ def test_read_raw_transactions_invalid_decimal(tmp_path: Path) -> None:
     assert "Invalid decimal in column 'quantity'" in message
 
 
-def test_read_raw_transactions_empty_file(tmp_path: Path) -> None:
+def test_read_raw_transactions_negative_fees(tmp_path: Path) -> None:
+    """Refuse negative fees, a sign typed the wrong way round."""
+    raw_file = tmp_path / "raw_negative_fees.csv"
+    rows = [
+        COLUMNS,
+        ["2024-01-04", "BUY", "XYZ", "100", "10.00", "-50.00", "GBP"],
+    ]
+    _write_csv(raw_file, rows)
+
+    with pytest.raises(ParsingError) as exc:
+        RawParser().load_from_file(raw_file)
+
+    message = str(exc.value)
+    assert "row 2" in message
+    assert "Fees cannot be negative. Enter the fees you paid as a positive number." in (
+        message
+    )
+
+
+@pytest.mark.parametrize(
+    "blank", ["", "   ", ",,,,,,"], ids=["empty line", "only spaces", "only commas"]
+)
+def test_read_raw_transactions_skips_a_blank_row(tmp_path: Path, blank: str) -> None:
+    """A row with nothing in it is ignored, and the rows after it keep their lines."""
+    raw_file = tmp_path / "raw_blank_row.csv"
+    raw_file.write_text(
+        "date,action,symbol,quantity,price,fees,currency\n"
+        "2024-01-02,BUY,XYZ,10,2.50,0,USD\n"
+        f"{blank}\n"
+        "2024-01-03,BUY,XYZ,5,3.00,0,USD\n",
+        encoding="utf-8",
+    )
+
+    transactions = RawParser().load_from_file(raw_file)
+
+    assert [t.source.row for t in transactions if t.source] == [2, 4]
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "2024-01-02,BUY, BRK B ,10,2.50,0.10,USD",
+        " 2024-01-02 ,BUY,BRK B,10,2.50,0.10,USD",
+        "2024-01-02, BUY ,BRK B,10,2.50,0.10,USD",
+        '2024-01-02,BUY, "BRK B" ,10,2.50,0.10,USD',
+    ],
+    ids=["symbol", "date", "action", "symbol in quotes"],
+)
+def test_read_raw_transactions_ignores_spaces_around_a_value(
+    tmp_path: Path, row: str
+) -> None:
+    """A space typed beside a comma is not part of the value; one inside it is.
+
+    A symbol kept with its space, or with the quotes typed after one, would be
+    a holding of its own, apart from the same symbol typed without them.
+    """
+    raw_file = tmp_path / "raw_spaces.csv"
+    raw_file.write_text(
+        f"date,action,symbol,quantity,price,fees,currency\n{row}\n", encoding="utf-8"
+    )
+
+    (transaction,) = RawParser().load_from_file(raw_file)
+
+    assert transaction.date == dt.date(2024, 1, 2)
+    assert transaction.action == ActionType.BUY
+    assert transaction.symbol == "BRK B"
+
+
+def test_read_raw_transactions_reads_a_cell_of_spaces_as_empty(tmp_path: Path) -> None:
+    """A cell holding only spaces is an empty cell: no symbol, and no fee."""
+    raw_file = tmp_path / "raw_cell_of_spaces.csv"
+    raw_file.write_text(
+        "date,action,symbol,quantity,price,fees,currency\n"
+        "2024-01-03,TRANSFER, ,1,1000.00, ,GBP\n",
+        encoding="utf-8",
+    )
+
+    (transaction,) = RawParser().load_from_file(raw_file)
+
+    assert transaction.symbol is None
+    assert transaction.fees == Decimal(0)
+
+
+def test_read_raw_transactions_refuses_a_row_that_runs_over_several_lines(
+    tmp_path: Path,
+) -> None:
+    """A double quote left open takes in the rows below it; they are not dropped.
+
+    The quote opened on row 2 is closed by the one on row 5, so the four rows
+    would be read as one purchase of 5 with the rest inside its symbol.
+    """
+    raw_file = tmp_path / "raw_open_quote.csv"
+    raw_file.write_text(
+        "date,action,symbol,quantity,price,fees,currency\n"
+        '2024-01-02,BUY,"BRK B,10,2.50,0.10,USD\n'
+        "2024-01-03,BUY,XYZ,10,2.50,0.10,USD\n"
+        "2024-01-04,BUY,XYZ,10,2.50,0.10,USD\n"
+        '2024-01-05,BUY,"BRK B,5,3.00,0.10,USD\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ParsingError) as exc:
+        RawParser().load_from_file(raw_file)
+
+    assert exc.value.row_index == 2
+    # The whole message, once: the other readers' tests stop at the rows.
+    assert exc.value.detail == (
+        "This row runs on to row 5, because one of its cells holds a line break. "
+        'If a double quote (") is opened on it and not closed, every row down to '
+        "there was read as part of that cell: close or remove the double quote. "
+        "Otherwise take the line break out of the cell."
+    )
+
+
+def test_read_raw_transactions_names_the_row_of_a_cell_too_long_to_read(
+    tmp_path: Path,
+) -> None:
+    """A double quote left open high up a long file is reported, with its row.
+
+    The reader gives up once the cell the quote opened passes 131,072
+    characters, before it hands the row over. That ended in a traceback naming
+    neither the file nor the row. The 4,000 rows below the quote come to
+    144,000 characters.
+    """
+    row = "2024-01-03,BUY,XYZ,10,2.50,0.10,USD\n"
+    raw_file = tmp_path / "raw_long_open_quote.csv"
+    raw_file.write_text(
+        "date,action,symbol,quantity,price,fees,currency\n"
+        "2024-01-02,BUY,XYZ,10,2.50,0.10,USD\n"
+        '2024-01-03,BUY,"XYZ,10,2.50,0.10,USD\n' + row * 4000,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ParsingError) as exc:
+        RawParser().load_from_file(raw_file)
+
+    assert exc.value.row_index == 3
+    assert exc.value.detail == (
+        "A cell that starts on this row is longer than a CSV cell can be "
+        '(131,072 characters). A double quote (") is probably opened on it and '
+        "not closed: close or remove it."
+    )
+
+
+def test_read_raw_transactions_names_the_row_of_another_reader_error() -> None:
+    """Whatever else the CSV reader refuses is reported with its row and its words.
+
+    A carriage return alone inside a line is one such case. It reaches the
+    reader when a line that ends in one is read from a stream that leaves it
+    as it is, as piped input can be. Here the third line ends in one, so the
+    fourth is read as part of it.
+    """
+    stream = io.StringIO(
+        "date,action,symbol,quantity,price,fees,currency\n"
+        "2024-01-02,BUY,XYZ,10,2.50,0.10,USD\n"
+        "2024-01-03,BUY,XYZ,10,2.50,0.10,USD\r"
+        "2024-01-04,BUY,XYZ,10,2.50,0.10,USD\n"
+    )
+
+    with pytest.raises(
+        ParsingError,
+        match=(
+            ", row 3: The CSV reader could not read this row: "
+            "new-line character seen in unquoted field"
+        ),
+    ):
+        RawParser().load_from_stream(stream, STDIN_PATH)
+
+
+def test_read_raw_transactions_reports_a_half_filled_row(tmp_path: Path) -> None:
+    """A row with any cell filled is not blank: it is reported, at its own line."""
+    raw_file = tmp_path / "raw_half_filled.csv"
+    raw_file.write_text(
+        "date,action,symbol,quantity,price,fees,currency\n\n,BUY,XYZ,10,2.50,0,USD\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ParsingError) as exc:
+        RawParser().load_from_file(raw_file)
+
+    assert exc.value.row_index == 3
+
+
+def test_read_raw_transactions_unknown_action_names_its_row(tmp_path: Path) -> None:
+    """A row the parser refuses outright is reported at its own line too.
+
+    The row above it is a good one, so an error dropped on the way out would
+    leave two transactions and no report at all.
+    """
+    raw_file = tmp_path / "raw_unknown_action.csv"
+    raw_file.write_text(
+        "date,action,symbol,quantity,price,fees,currency\n"
+        "2023-02-09,BUY,XYZ,10,2.50,0,USD\n"
+        "2023-02-10,NONSENSE,XYZ,10,2.50,0,USD\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ParsingError, match="Unknown action: NONSENSE") as exc:
+        RawParser().load_from_file(raw_file)
+
+    assert exc.value.row_index == 3
+
+
+@pytest.mark.parametrize(
+    "content", ["", "\n   \n,,,,,,\n"], ids=["no bytes", "only blank rows"]
+)
+def test_read_raw_transactions_empty_file(tmp_path: Path, content: str) -> None:
     """Error when RAW CSV is empty."""
 
     raw_file = tmp_path / "empty.csv"
-    raw_file.write_text("", encoding="utf-8")
+    raw_file.write_text(content, encoding="utf-8")
 
     with pytest.raises(ParsingError) as exc:
         RawParser().load_from_file(raw_file)
@@ -196,34 +536,130 @@ def test_read_raw_transactions_empty_file(tmp_path: Path) -> None:
     assert "CSV file is empty" in str(exc.value)
 
 
-def test_read_raw_transactions_applies_ticker_renames(tmp_path: Path) -> None:
-    """Rename known tickers according to configuration."""
+@pytest.mark.parametrize(
+    ("symbol", "date", "expected"),
+    [
+        pytest.param("FB", "2012-05-18", "META", id="listing-day"),
+        pytest.param("FB", "2023-09-01", "META", id="kept-after-the-change"),
+        pytest.param("FB", "2025-06-25", "META", id="last-day-unused"),
+        pytest.param("FB", "2025-06-26", "FB", id="reused"),
+        pytest.param("FB", "2002-06-03", "FB", id="used-before"),
+        pytest.param("BLL", "2021-06-01", "BALL", id="no-dates-stated"),
+    ],
+)
+def test_a_renamed_ticker_without_an_isin_is_renamed_by_its_date(
+    tmp_path: Path, symbol: str, date: str, expected: str
+) -> None:
+    """A row without an ISIN is renamed only while nobody else had the ticker.
 
-    raw_file = tmp_path / "raw_ticker_rename.csv"
+    FB was Meta's from its 2012 listing, kept by some histories after Meta's
+    2022 rename, and a ProShares ETF's from 26 June 2025; FBR Asset
+    Investment used it in 2002-2003. Ball's rename states neither date,
+    since no other security is known to have used BLL on an exchange a
+    supported broker offers, so it applies on any.
+    """
+    raw_file = tmp_path / "raw.csv"
+    _write_csv(raw_file, [COLUMNS, [date, "BUY", symbol, "1", "10.00", "0.00", "USD"]])
+
+    (transaction,) = RawParser().load_from_file(raw_file)
+
+    assert transaction.symbol == expected
+
+
+@pytest.mark.parametrize(
+    ("dates", "message"),
+    [
+        pytest.param(
+            ("2021-06-01", "2025-06-26"),
+            "Rows under FB fall on both sides of 2025-06-26, when another security "
+            "started trading as FB, so cgt-calc cannot tell which rows belong to "
+            "Meta Platforms. Write META on every Meta Platforms row.",
+            id="reused",
+        ),
+        pytest.param(
+            ("2002-06-03", "2021-06-01"),
+            "Rows under FB fall on both sides of 2012-05-18, when Meta Platforms "
+            "started trading as FB, so cgt-calc cannot tell which rows belong to "
+            "Meta Platforms. Write META on every Meta Platforms row.",
+            id="used-before",
+        ),
+    ],
+)
+def test_rows_on_both_sides_of_a_ticker_changing_hands_are_refused(
+    tmp_path: Path, dates: tuple[str, str], message: str
+) -> None:
+    """Without an ISIN, nothing says which of the rows are which security's.
+
+    FB rows from 2021 and 2025 may be Meta and the ProShares ETF, or Meta
+    throughout.
+    """
+    raw_file = tmp_path / "raw.csv"
+    _write_csv(
+        raw_file,
+        [
+            COLUMNS,
+            *([date, "BUY", "FB", "1", "10.00", "0.00", "USD"] for date in dates),
+        ],
+    )
+
+    with pytest.raises(ParsingError, match=re.escape(message)):
+        RawParser().load_from_file(raw_file)
+
+
+def test_rows_that_are_all_another_security_s_are_left_alone(tmp_path: Path) -> None:
+    """FB rows from 2002 and July 2025 are none of them Meta's.
+
+    They fall on both sides of both days FB changed hands, but no row would
+    be renamed, so there is nothing to tell apart.
+    """
+    raw_file = tmp_path / "raw.csv"
+    _write_csv(
+        raw_file,
+        [
+            COLUMNS,
+            ["2002-06-03", "BUY", "FB", "1", "10.00", "0.00", "USD"],
+            ["2025-07-01", "BUY", "FB", "1", "10.00", "0.00", "USD"],
+        ],
+    )
+
+    transactions = RawParser().load_from_file(raw_file)
+
+    assert [transaction.symbol for transaction in transactions] == ["FB", "FB"]
+
+
+def test_read_raw_transactions_transfer_from_spouse(tmp_path: Path) -> None:
+    """Parse a RAW TRANSFER_FROM_SPOUSE row: shares arriving at a stated cost."""
+
+    raw_file = tmp_path / "raw_transfer_from_spouse.csv"
     rows = [
         COLUMNS,
-        [
-            "2024-01-05",
-            "BUY",
-            "FB",
-            "1",
-            "10.00",
-            "0.00",
-            "USD",
-        ],
+        ["2024-03-16", "TRANSFER_FROM_SPOUSE", "XYZ", "21.5", "95.60", "0.00", "GBP"],
     ]
     _write_csv(raw_file, rows)
 
     transactions = RawParser().load_from_file(raw_file)
 
     assert len(transactions) == 1
-    assert transactions[0].symbol == "META"
+    transaction = transactions[0]
+    assert transaction.action == ActionType.TRANSFER_FROM_SPOUSE
+    assert transaction.quantity == Decimal("21.5")
+    assert transaction.price == Decimal("95.60")
 
 
-def test_parse_decimal_missing_value_raises() -> None:
-    """Ensure empty required decimals raise an explicit error."""
+def test_read_raw_transactions_gift(tmp_path: Path) -> None:
+    """Parse a RAW GIFT row: shares given away, priced at market value."""
 
-    row = dict.fromkeys(RawColumn, "")
+    raw_file = tmp_path / "raw_gift.csv"
+    rows = [
+        COLUMNS,
+        ["2024-03-16", "GIFT", "XYZ", "21.5", "480.00", "0.00", "USD"],
+    ]
+    _write_csv(raw_file, rows)
 
-    with pytest.raises(ValueError, match="Missing value in column 'quantity'"):
-        _parse_decimal(row, RawColumn.QUANTITY, allow_empty=False)
+    transactions = RawParser().load_from_file(raw_file)
+
+    assert len(transactions) == 1
+    transaction = transactions[0]
+    assert transaction.action == ActionType.GIFT
+    assert transaction.quantity == Decimal("21.5")
+    assert transaction.price == Decimal("480.00")

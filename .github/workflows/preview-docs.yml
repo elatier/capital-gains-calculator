@@ -1,0 +1,236 @@
+name: Docs preview
+
+on:
+  workflow_run:
+    workflows:
+      - Build docs
+    types:
+      - completed
+
+concurrency:
+  group: docs-preview-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+  HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+  COMMENT_MARKER: "<!-- cgt-calc-docs-preview -->"
+  STATUS_CONTEXT: Docs preview
+
+jobs:
+  preview:
+    name: Deploy preview
+    if: >-
+      github.repository_owner == 'cgt-calc' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: docs-preview
+    # Reads only: the build's artifacts, the open pull requests and the
+    # comment script. The status and the comment are written with the bot's
+    # token instead, so that they are the bot's and not GitHub Actions'.
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Create bot token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.CGTBOT_CLIENT_ID }}
+          private-key: ${{ secrets.CGTBOT_PRIVATE_KEY }}
+          permission-pull-requests: write
+          permission-statuses: write
+
+      - name: Resolve PR
+        id: pr
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+        run: |
+          # Matching the head commit too stops a rerun of an older build from
+          # replacing the preview of the PR's current commit.
+          PR=$(gh api "repos/${GH_REPO}/pulls?state=open" --paginate |
+            jq -c --arg b "${HEAD_BRANCH}" --arg r "${HEAD_REPO}" --arg s "${HEAD_SHA}" \
+              'first(.[] | select(.head.ref == $b and .head.repo.full_name == $r and .head.sha == $s) | {number, base_sha: .base.sha})')
+          if [ -z "${PR}" ] || [ "${PR}" = "null" ]; then
+            echo "No open PR for ${HEAD_REPO}:${HEAD_BRANCH} at ${HEAD_SHA}; nothing to preview."
+            exit 0
+          fi
+          {
+            echo "number=$(jq -r .number <<<"${PR}")"
+            echo "base_sha=$(jq -r .base_sha <<<"${PR}")"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set status pending
+        if: steps.pr.outputs.number
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api --method POST "repos/${GH_REPO}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="${STATUS_CONTEXT}" -f description="Deploying preview"
+
+      - name: Download PR site
+        if: steps.pr.outputs.number
+        uses: actions/download-artifact@v8
+        with:
+          name: site
+          path: site
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The build ran the pull request's own code, so the site may hold
+      # anything. Cloudflare Pages runs a _worker.js file or directory as
+      # server-side code, so the preview carries static files only.
+      - name: Reject server-side code
+        if: steps.pr.outputs.number
+        run: |
+          if [ -e site/_worker.js ]; then
+            echo "::error::The built site contains _worker.js, which Cloudflare Pages would run as a Worker."
+            exit 1
+          fi
+
+      - name: Download PR digest
+        if: steps.pr.outputs.number
+        uses: actions/download-artifact@v8
+        with:
+          name: docs-digest
+          path: pr-digest
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find base digest run
+        id: base
+        if: steps.pr.outputs.number
+        env:
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+        run: |
+          RUN_ID=$(gh api "repos/${GH_REPO}/actions/workflows/docs.yml/runs?branch=main&head_sha=${BASE_SHA}&status=success" \
+            --jq '.workflow_runs[0].id // empty')
+          if [ -z "${RUN_ID}" ]; then
+            RUN_ID=$(gh api "repos/${GH_REPO}/actions/workflows/docs.yml/runs?branch=main&event=push&status=success&per_page=1" \
+              --jq '.workflow_runs[0].id // empty')
+          fi
+          echo "run_id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download base digest
+        if: steps.pr.outputs.number && steps.base.outputs.run_id
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: docs-digest
+          path: base-digest
+          run-id: ${{ steps.base.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compare digests
+        id: compare
+        if: steps.pr.outputs.number
+        run: |
+          if [ -f base-digest/digest.txt ] && diff -q pr-digest/digest.txt base-digest/digest.txt >/dev/null 2>&1; then
+            echo "unchanged=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "unchanged=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      # A workflow_run workflow checks out the default branch, so the script is
+      # main's and never the pull request's. It goes in a directory of its
+      # own, after the downloads, so nothing in the pull request's artifacts
+      # can stand in for it, and wrangler still deploys from a directory that
+      # is not a checkout.
+      - name: Check out the comment script
+        if: steps.pr.outputs.number
+        uses: actions/checkout@v7
+        with:
+          path: main
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Report no change
+        if: steps.pr.outputs.number && steps.compare.outputs.unchanged == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api --method POST "repos/${GH_REPO}/statuses/${HEAD_SHA}" \
+            -f state=success -f context="${STATUS_CONTEXT}" \
+            -f description="No rendered changes" \
+            -f target_url="https://cgt-calc.uk/"
+
+      - name: Refresh the stale preview comment
+        # An earlier preview comment would now link to stale content. Without
+        # one there is nothing to correct, so none is posted.
+        if: steps.pr.outputs.number && steps.compare.outputs.unchanged == 'true'
+        env:
+          COMMENT_TOKEN: ${{ steps.app-token.outputs.token }}
+          COMMENT_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          UPDATED=$(TZ='Europe/London' date '+%Y-%m-%d %H:%M %Z')
+          BODY=$(printf '%s\n📖 No rendered changes — this PR matches the live docs at https://cgt-calc.uk/\n\n_Checked %s · updated %s_' \
+            "${COMMENT_MARKER}" "${HEAD_SHA:0:7}" "${UPDATED}")
+          python3 main/scripts/pr_comment.py --repo "${GH_REPO}" --pull "${PR_NUMBER}" \
+            --marker "${COMMENT_MARKER}" --update "${BODY}"
+
+      - name: Deploy to Cloudflare Pages
+        id: deploy
+        if: steps.pr.outputs.number && steps.compare.outputs.unchanged != 'true'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy site --project-name=cgt-calc --branch=pr-${{ steps.pr.outputs.number }} --commit-dirty=true
+
+      - name: Collect preview facts
+        id: facts
+        if: steps.pr.outputs.number && steps.compare.outputs.unchanged != 'true'
+        env:
+          NUMBER: ${{ steps.pr.outputs.number }}
+          ALIAS_URL: ${{ steps.deploy.outputs.pages-deployment-alias-url }}
+        run: |
+          URL="${ALIAS_URL}"
+          [ -z "${URL}" ] && URL="https://pr-${NUMBER}.cgt-calc.pages.dev"
+          {
+            echo "url=${URL}"
+            echo "short_sha=${HEAD_SHA:0:7}"
+            echo "updated=$(TZ='Europe/London' date '+%Y-%m-%d %H:%M %Z')"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Report preview ready
+        if: steps.pr.outputs.number && steps.compare.outputs.unchanged != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api --method POST "repos/${GH_REPO}/statuses/${HEAD_SHA}" \
+            -f state=success -f context="${STATUS_CONTEXT}" \
+            -f description="Preview ready" \
+            -f target_url="${{ steps.facts.outputs.url }}"
+
+      - name: Comment preview link
+        if: steps.pr.outputs.number && steps.compare.outputs.unchanged != 'true'
+        env:
+          COMMENT_TOKEN: ${{ steps.app-token.outputs.token }}
+          COMMENT_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          URL: ${{ steps.facts.outputs.url }}
+          SHORT_SHA: ${{ steps.facts.outputs.short_sha }}
+          UPDATED: ${{ steps.facts.outputs.updated }}
+        run: |
+          BUILT=$(printf '%s\n📖 **Docs preview:** %s\n\n_Built from %s' \
+            "${COMMENT_MARKER}" "${URL}" "${SHORT_SHA}")
+          # A comment that is already there also notes when it was refreshed.
+          python3 main/scripts/pr_comment.py --repo "${GH_REPO}" --pull "${PR_NUMBER}" \
+            --marker "${COMMENT_MARKER}" \
+            --create "${BUILT}_" --update "${BUILT} · updated ${UPDATED}_"
+
+      - name: Report failure
+        if: failure() && steps.pr.outputs.number
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api --method POST "repos/${GH_REPO}/statuses/${HEAD_SHA}" \
+            -f state=failure -f context="${STATUS_CONTEXT}" \
+            -f description="Preview failed" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

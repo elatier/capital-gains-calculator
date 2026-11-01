@@ -1,0 +1,40 @@
+Final portfolio
+  VHVG: 3563.00
+
+Final balance
+  Hargreaves Lansdown: -55018.97 (GBP)
+
+Interest
+  Hargreaves Lansdown: 3.87 (GBP)
+
+Portfolio at the end of 2025/2026 tax year
+  VHVG: 3,563.00, £117,132.23
+
+Tax summary for 2025/2026
+
+Capital gains
+  Disposals:                   1
+  Disposal proceeds:  £45,000.00
+  Allowable costs:    £32,886.56
+  Gain:               £12,113.44
+  Loss:                    £0.00
+  Total gain:         £12,113.44
+  Taxable gain:        £9,113.44
+  Tax at basic rate:   £1,640.42
+  Tax at higher rate:  £2,187.23
+Basic rate (18%): your taxable income for 2025/2026 plus the taxable gain is £37,700 or less.
+Higher rate (24%): your taxable income for 2025/2026 is £37,700 or more.
+If your taxable income is under £37,700 but the taxable gain takes you over it, you pay the basic rate on the part of it that fits under £37,700 and the higher rate on the rest. Your tax is then between the two figures.
+Taxable income is your income after the Personal Allowance and other Income Tax reliefs.
+To get a single figure, add --income with your income for 2025/2026 before the Personal Allowance, such as the pay on your P60. cgt-calc adds the dividends and interest in these files.
+The tax is an estimate: it leaves out gains that are not in the files you supplied, losses brought forward and reliefs. See https://cgt-calc.uk/tax-estimates/#what-the-estimates-leave-out
+
+Dividends
+  Proceeds:                £0.00
+  Tax-free allowance:    £500.00
+  Taxable proceeds:        £0.00
+
+Interest
+  UK proceeds:             £3.87
+  Foreign proceeds:        £0.00
+  Tax paid:                £0.00

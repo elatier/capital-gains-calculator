@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
-import csv
-import datetime
-from decimal import Decimal, InvalidOperation
+import datetime as dt
+from decimal import Decimal
 from enum import StrEnum
 import logging
-from typing import TYPE_CHECKING, ClassVar, Final, Literal, TextIO, overload
+from typing import TYPE_CHECKING, ClassVar, Final, TextIO, overload, override
 
-from cgt_calc.const import TICKER_RENAMES
 from cgt_calc.exceptions import ParsingError, UnexpectedColumnCountError
-from cgt_calc.model import ActionType, BrokerTransaction
+from cgt_calc.model import (
+    ActionType,
+    BrokerTransaction,
+    CurrencyCode,
+    TransactionSource,
+)
+from cgt_calc.util import is_blank_row, parse_decimal
 
-from .base_parsers import BaseSingleFileParser
+from .base_parsers import BaseSingleFileParser, read_csv_rows
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -49,7 +53,6 @@ def _parse_decimal(
     row: dict[RawColumn, str],
     column: RawColumn,
     *,
-    allow_empty: Literal[True],
     default: Decimal,
 ) -> Decimal: ...
 
@@ -59,43 +62,23 @@ def _parse_decimal(
     row: dict[RawColumn, str],
     column: RawColumn,
     *,
-    allow_empty: Literal[True],
     default: None = ...,
 ) -> Decimal | None: ...
 
 
-@overload
 def _parse_decimal(
     row: dict[RawColumn, str],
     column: RawColumn,
     *,
-    allow_empty: Literal[False],
-    default: None = ...,
-) -> Decimal: ...
-
-
-def _parse_decimal(
-    row: dict[RawColumn, str],
-    column: RawColumn,
-    *,
-    allow_empty: bool,
     default: Decimal | None = None,
 ) -> Decimal | None:
     """Parse decimal value from the row, raising ValueError with context on failure."""
 
     value = row[column]
     if value == "":
-        if allow_empty:
-            return default
-        raise ValueError(f"Missing value in column '{column.value}'")
+        return default
 
-    normalized = value.replace(",", "")
-    try:
-        return Decimal(normalized)
-    except InvalidOperation as err:
-        raise ValueError(
-            f"Invalid decimal in column '{column.value}': {value!r}"
-        ) from err
+    return parse_decimal(value, f"column '{column.value}'", strip=",")
 
 
 class RawTransaction(BrokerTransaction):
@@ -107,6 +90,8 @@ class RawTransaction(BrokerTransaction):
     2022-08-15,BUY,META,105,180.50,0.00,USD
     2022-07-26,DIVIDEND,OTGLY,305,0.031737,0.0,USD
     2022-06-06,STOCK_SPLIT,AMZN,209,0.00,0.00,USD
+    2023-03-16,TRANSFER_TO_SPOUSE,META,21.5,0.00,0.00,USD
+    2023-03-16,TRANSFER_FROM_SPOUSE,META,21.5,95.60,0.00,GBP
 
     See tests/raw/data/test_data.csv for a sample file showing the expected format.
     """
@@ -120,26 +105,28 @@ class RawTransaction(BrokerTransaction):
         if len(row) != CSV_COLUMNS_NUM:
             raise UnexpectedColumnCountError(row, CSV_COLUMNS_NUM, file)
 
+        # A space typed beside a comma is not part of the value: kept on a
+        # symbol, it would make a holding of its own.
         row_values: dict[RawColumn, str] = {
-            column: row[i] for i, column in enumerate(RawColumn)
+            column: row[i].strip() for i, column in enumerate(RawColumn)
         }
 
         date_str = row_values[RawColumn.DATE]
-        date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+        date = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
 
         action = _action_from_str(row_values[RawColumn.ACTION], file)
         symbol = row_values[RawColumn.SYMBOL] or None
-
-        if symbol is not None:
-            symbol = TICKER_RENAMES.get(symbol, symbol)
-        quantity = _parse_decimal(row_values, RawColumn.QUANTITY, allow_empty=True)
-        price = _parse_decimal(row_values, RawColumn.PRICE, allow_empty=True)
-        fees = _parse_decimal(
-            row_values,
-            RawColumn.FEES,
-            allow_empty=True,
-            default=Decimal(0),
-        )
+        quantity = _parse_decimal(row_values, RawColumn.QUANTITY)
+        price = _parse_decimal(row_values, RawColumn.PRICE)
+        fees = _parse_decimal(row_values, RawColumn.FEES, default=Decimal(0))
+        # No action takes negative fees: deductions and withdrawals go in the
+        # price. Other parsers can produce them legitimately (a commission
+        # rebate, or rounding in a derived fee), so this is checked only where
+        # a person types the value.
+        if fees < 0:
+            raise ValueError(
+                "Fees cannot be negative. Enter the fees you paid as a positive number."
+            )
 
         if price is not None and quantity is not None:
             amount = price * quantity
@@ -150,7 +137,7 @@ class RawTransaction(BrokerTransaction):
         else:
             amount = None
 
-        currency = row_values[RawColumn.CURRENCY]
+        currency = CurrencyCode(row_values[RawColumn.CURRENCY])
         broker = "Unknown"
         super().__init__(
             date,
@@ -166,12 +153,21 @@ class RawTransaction(BrokerTransaction):
         )
 
 
-class RawParser(BaseSingleFileParser):
+class RawParser(BaseSingleFileParser[RawTransaction]):
     """Parser for RAW format transaction files."""
 
     arg_name = "raw"
     pretty_name = "RAW format"
+    # The format documents that rows for one date are written in the order
+    # they happened, each in the units in force at that point: see "The order
+    # of rows on one date" in docs/brokers/raw.md, which is what a user writing
+    # the file by hand is told to do. No broker export makes that promise.
+    rows_in_time_order: ClassVar[bool] = True
     format_name = "CSV"
+    argument_help = (
+        "transactions in cgt-calc's own RAW CSV format, for other brokers and for "
+        "events added by hand"
+    )
     deprecated_flags: ClassVar[list[str]] = ["--raw"]
 
     @staticmethod
@@ -179,7 +175,7 @@ class RawParser(BaseSingleFileParser):
         """Validate optional header row."""
 
         if len(header) != CSV_COLUMNS_NUM:
-            raise UnexpectedColumnCountError(header, CSV_COLUMNS_NUM, file)
+            raise UnexpectedColumnCountError(header, CSV_COLUMNS_NUM, file, row_index=1)
 
         normalized = [value.strip().lower() for value in header]
         for index, (exp, act) in enumerate(
@@ -189,6 +185,7 @@ class RawParser(BaseSingleFileParser):
                 raise ParsingError(
                     file,
                     f"Expected column {index} to be '{exp}' but found '{header[index - 1]}'",
+                    row_index=1,
                 )
 
     @staticmethod
@@ -202,13 +199,15 @@ class RawParser(BaseSingleFileParser):
         )
 
     @classmethod
-    def read_transactions(
-        cls, file: TextIO, file_path: Path
-    ) -> list[BrokerTransaction]:
+    @override
+    def read_transactions(cls, file: TextIO, file_path: Path) -> list[RawTransaction]:
         """Read Raw transactions from file."""
-        lines = list(csv.reader(file))
+        # A space after a comma is skipped here, not left to the trim in
+        # `RawTransaction`: a value in quotes is only read as quoted when the
+        # quote is the first thing in its cell.
+        lines = read_csv_rows(file, file_path, skipinitialspace=True)
 
-        if not lines:
+        if all(is_blank_row(row) for row in lines):
             raise ParsingError(file_path, "RAW CSV file is empty")
 
         data_rows = lines
@@ -223,13 +222,18 @@ class RawParser(BaseSingleFileParser):
                 file_path,
             )
 
-        transactions: list[BrokerTransaction] = []
+        transactions: list[RawTransaction] = []
         for index, row in enumerate(data_rows, start=start_index):
+            # Skip harmless blank rows left by editors or tooling.
+            if is_blank_row(row):
+                continue
             try:
-                transactions.append(RawTransaction(row, file_path))
+                transaction = RawTransaction(row, file_path)
             except ParsingError as err:
                 err.add_row_context(index)
                 raise
             except ValueError as err:
                 raise ParsingError(file_path, str(err), row_index=index) from err
+            transaction.source = TransactionSource(row=index)
+            transactions.append(transaction)
         return transactions

@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import csv
+from decimal import Decimal
+import shutil
 from typing import TYPE_CHECKING
 
 import pytest
 
-from cgt_calc.exceptions import ParsingError
+from cgt_calc.exceptions import InvalidTransactionError, ParsingError
+from cgt_calc.model import ActionType
 from cgt_calc.parsers.sharesight import SharesightParser
 
 if TYPE_CHECKING:
     from pathlib import Path
 from pathlib import Path
-import subprocess
 
-from tests.utils import build_cmd
+from tests.utils import (
+    assert_stdout_matches,
+    build_cmd,
+    report_path,
+    run_cli,
+    stderr_alerts,
+)
 
 
 def _write_csv(path: Path, rows: list[list[str]]) -> None:
@@ -24,7 +32,9 @@ def _write_csv(path: Path, rows: list[list[str]]) -> None:
         writer.writerows(rows)
 
 
-def test_run_with_sharesight_files_no_balance_check() -> None:
+def test_run_with_sharesight_files_no_balance_check(
+    request: pytest.FixtureRequest,
+) -> None:
     """Runs the tool and verifies it doesn't fail."""
     cmd = build_cmd(
         "--year",
@@ -32,28 +42,33 @@ def test_run_with_sharesight_files_no_balance_check() -> None:
         "--sharesight-dir",
         "tests/sharesight/data/inputs/",
         "--no-balance-check",
+        "--output",
+        report_path(request),
     )
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode:
-        pytest.fail(
-            "Integration test failed\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
-    assert result.stderr == "", "Run with example files generated errors"
+    result = run_cli(cmd)
+    assert stderr_alerts(result.stderr) == [], "Run with example files generated errors"
     expected_file = (
         Path("tests")
         / "sharesight"
         / "data"
         / "test_run_with_sharesight_files_no_balance_check_output.txt"
     )
-    expected = expected_file.read_text()
-    cmd_str = " ".join([param if param else "''" for param in cmd])
-    assert result.stdout == expected, (
-        "Run with example files generated unexpected outputs, "
-        "if you added new features update the test with:\n"
-        f"{cmd_str} > {expected_file}"
-    )
+    assert_stdout_matches(result, cmd, expected_file)
+
+
+def test_real_exports_preserve_physical_row_numbers() -> None:
+    """Keep the physical CSV line for trades and income transactions."""
+    transactions = SharesightParser.load_from_dir(Path("tests/sharesight/data/inputs"))
+
+    rows = {
+        (transaction.date.isoformat(), transaction.symbol, transaction.action): (
+            transaction.source.row if transaction.source else None
+        )
+        for transaction in transactions
+    }
+    assert rows["2019-08-01", "FX:ETH", ActionType.BUY] == 4
+    assert rows["2020-11-10", "FUND1.UKF", ActionType.DIVIDEND] == 7
+    assert rows["2020-10-10", "FOO.NASDAQ", ActionType.DIVIDEND_TAX] == 14
 
 
 def test_parse_income_report_missing_local_column(tmp_path: Path) -> None:
@@ -136,10 +151,10 @@ def test_parse_trade_report_missing_column(tmp_path: Path) -> None:
                 "Type",
                 "Date",
                 "Quantity",
-                "Price *",
                 "Brokerage *",
                 "Currency",
                 "Exchange Rate",
+                "Value",
                 "Comments",
             ],
             [
@@ -149,10 +164,10 @@ def test_parse_trade_report_missing_column(tmp_path: Path) -> None:
                 "Buy",
                 "01/01/2020",
                 "1",
-                "100",
                 "0",
                 "USD",
                 "1.2",
+                "100",
                 "Note",
             ],
         ],
@@ -160,7 +175,7 @@ def test_parse_trade_report_missing_column(tmp_path: Path) -> None:
 
     with pytest.raises(
         ParsingError,
-        match="Missing expected columns in Sharesight trades header: Value",
+        match=r"Missing expected columns in Sharesight trades header: Price \*",
     ) as excinfo:
         list(SharesightParser().load_from_dir(tmp_path))
 
@@ -210,3 +225,827 @@ def test_parse_trade_report_invalid_decimal(tmp_path: Path) -> None:
         list(SharesightParser().load_from_dir(tmp_path))
 
     assert excinfo.value.row_index == 2
+
+
+TRADE_HEADER = [
+    "Market",
+    "Code",
+    "Name",
+    "Type",
+    "Date",
+    "Quantity",
+    "Price *",
+    "Brokerage *",
+    "Currency",
+    "Exchange Rate",
+    "Value",
+    "Comments",
+]
+
+# Exercise the newer header aliases together. This is deliberately not labelled
+# as a verbatim export fixture; keep it independent of the parser mapping so a
+# wrong alias there fails the tests.
+ALIASED_TRADE_HEADER = [
+    "Code",
+    "Market Code",
+    "Name",
+    "Date",
+    "Type",
+    "Qty",
+    "Price",
+    "Instrument Currency",
+    "Brokerage",
+    "Brokerage Currency",
+    "Exch. Rate",
+    "Value",
+    "Comments",
+]
+
+LOCAL_DIVIDEND_HEADER = [
+    "Code",
+    "Name",
+    "Date Paid",
+    "Net Dividend",
+    "Tax Deducted",
+    "Tax Credit",
+    "Gross Dividend",
+    "Comments",
+]
+
+FOREIGN_DIVIDEND_HEADER = [
+    "Code",
+    "Name",
+    "Date Paid",
+    "Exchange Rate",
+    "Currency",
+    "Net Amount",
+    "Foreign Tax Deducted",
+    "Gross Amount",
+    "Comments",
+]
+
+
+def test_parse_income_report_with_uppercase_csv_extension(tmp_path: Path) -> None:
+    """Parse an income report whose CSV extension is uppercase."""
+    _write_csv(
+        tmp_path / "Taxable Income Report.CSV",
+        [
+            ["Taxable Income Report"],
+            ["Local Income"],
+            ["Dividend Payments"],
+            LOCAL_DIVIDEND_HEADER,
+            ["ABC", "AB Corp", "01/02/2023", "90", "10", "0", "100", "local divi"],
+            ["Total"],
+            ["Total Local Income"],
+            ["Foreign Income"],
+            FOREIGN_DIVIDEND_HEADER,
+            ["XYZ", "X Corp", "03/04/2023", "1.2", "USD", "85", "15", "100", "foreign"],
+            ["Total"],
+        ],
+    )
+
+    transactions = SharesightParser().load_from_dir(tmp_path)
+
+    assert [transaction.action for transaction in transactions] == [
+        ActionType.DIVIDEND,
+        ActionType.DIVIDEND_TAX,
+        ActionType.DIVIDEND,
+        ActionType.DIVIDEND_TAX,
+    ]
+    assert [transaction.amount for transaction in transactions] == [
+        Decimal(100),
+        Decimal(-10),
+        Decimal(100),
+        Decimal(-15),
+    ]
+    assert [transaction.currency for transaction in transactions] == [
+        "GBP",
+        "GBP",
+        "USD",
+        "USD",
+    ]
+
+
+def test_parse_income_report_skips_an_empty_line_outside_a_dividend_list(
+    tmp_path: Path,
+) -> None:
+    """An empty line between the report's sections is not a row of any of them."""
+    _write_csv(
+        tmp_path / "Taxable Income Report.csv",
+        [
+            [],
+            ["Local Income"],
+            [],
+            ["Dividend Payments"],
+            LOCAL_DIVIDEND_HEADER,
+            ["ABC", "AB Corp", "01/02/2023", "90", "10", "0", "100", "local divi"],
+            ["Total"],
+            [],
+            ["Total Local Income"],
+            [],
+            ["Foreign Income"],
+            FOREIGN_DIVIDEND_HEADER,
+            ["XYZ", "X Corp", "03/04/2023", "1.2", "USD", "85", "15", "100", "foreign"],
+            ["Total"],
+            [],
+        ],
+    )
+
+    transactions = SharesightParser().load_from_dir(tmp_path)
+
+    assert [transaction.amount for transaction in transactions] == [
+        Decimal(100),
+        Decimal(-10),
+        Decimal(100),
+        Decimal(-15),
+    ]
+    # A skipped line is still a line of the file: the rows below keep theirs.
+    assert [
+        transaction.source.row if transaction.source else None
+        for transaction in transactions
+    ] == [6, 6, 13, 13]
+
+
+def test_parse_income_report_refuses_an_empty_line_in_a_dividend_list(
+    tmp_path: Path,
+) -> None:
+    """An empty line among the dividends is reported at its row, not skipped."""
+    _write_csv(
+        tmp_path / "Taxable Income Report.csv",
+        [
+            ["Foreign Income"],
+            FOREIGN_DIVIDEND_HEADER,
+            ["XYZ", "X Corp", "03/04/2023", "1.2", "USD", "85", "15", "100", "foreign"],
+            [],
+            ["XYZ", "X Corp", "03/05/2023", "1.2", "USD", "85", "15", "100", "foreign"],
+            ["Total"],
+        ],
+    )
+
+    with pytest.raises(
+        ParsingError,
+        match=f"This row has 1 columns, not {len(FOREIGN_DIVIDEND_HEADER)}",
+    ) as excinfo:
+        SharesightParser().load_from_dir(tmp_path)
+
+    assert excinfo.value.row_index == 4
+
+
+def test_parse_income_report_with_informational_columns(tmp_path: Path) -> None:
+    """Ignore newer Taxable Income columns not used by the calculation."""
+    _write_csv(
+        tmp_path / "Taxable Income Report.csv",
+        [
+            ["Foreign Income"],
+            [*FOREIGN_DIVIDEND_HEADER, "Country", "Income Type"],
+            [
+                "XYZ",
+                "X Corp",
+                "03/04/2023",
+                "1.2",
+                "USD",
+                "85",
+                "15",
+                "100",
+                "foreign",
+                "United States",
+                "Dividend",
+            ],
+            ["Total"],
+        ],
+    )
+
+    transactions = SharesightParser().load_from_dir(tmp_path)
+
+    assert [transaction.action for transaction in transactions] == [
+        ActionType.DIVIDEND,
+        ActionType.DIVIDEND_TAX,
+    ]
+    assert [transaction.amount for transaction in transactions] == [
+        Decimal(100),
+        Decimal(-15),
+    ]
+
+
+def test_parse_income_report_missing_currency_value(tmp_path: Path) -> None:
+    """Raise when a foreign dividend row has no currency."""
+    _write_csv(
+        tmp_path / "Taxable Income Report.csv",
+        [
+            ["Foreign Income"],
+            FOREIGN_DIVIDEND_HEADER,
+            ["XYZ", "X Corp", "03/04/2023", "1.2", "", "85", "15", "100", "foreign"],
+        ],
+    )
+
+    with pytest.raises(ParsingError, match="Missing currency in column"):
+        SharesightParser().load_from_dir(tmp_path)
+
+
+def test_parse_income_report_section_without_rows(tmp_path: Path) -> None:
+    """Produce nothing when the dividend section ends at the file end."""
+    _write_csv(
+        tmp_path / "Taxable Income Report.csv",
+        [
+            ["Local Income"],
+            ["Dividend Payments"],
+        ],
+    )
+
+    assert SharesightParser().load_from_dir(tmp_path) == []
+
+
+def test_unknown_report_is_ignored(tmp_path: Path) -> None:
+    """Ignore CSV files that are not Sharesight reports."""
+    _write_csv(tmp_path / "Some Other Report.csv", [["Header"], ["Data"]])
+
+    assert SharesightParser().load_from_dir(tmp_path) == []
+
+
+def test_parse_trade_report(tmp_path: Path) -> None:
+    """Parse buys, sells, FX trades and stock activity."""
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [
+            ["All Trades Report"],
+            TRADE_HEADER,
+            [
+                "NASDAQ",
+                "FOO",
+                "Foo Inc",
+                "Buy",
+                "01/02/2023",
+                "10",
+                "5.5",
+                "1",
+                "USD",
+                "1",
+                "44",
+                "buy",
+            ],
+            [
+                "NASDAQ",
+                "FOO",
+                "Foo Inc",
+                "Sell",
+                "02/02/2023",
+                "-5",
+                "6",
+                "",
+                "USD",
+                "1",
+                "30",
+                "sell",
+            ],
+            [
+                "FX",
+                "USDGBP",
+                "FX trade",
+                "Sell",
+                "03/02/2023",
+                "-100",
+                "1.25",
+                "0",
+                "USD",
+                "1.25",
+                "80",
+                "fx",
+            ],
+            [
+                "NASDAQ",
+                "NVDA",
+                "Nvidia",
+                "Buy",
+                "04/02/2023",
+                "2",
+                "100",
+                "0",
+                "USD",
+                "1",
+                "",
+                "Stock Activity vest",
+            ],
+            ["", "", "", "", "", "", "", "", "", "", "", ""],
+        ],
+    )
+
+    transactions = SharesightParser().load_from_dir(tmp_path)
+
+    assert len(transactions) == 4
+
+    buy, sell, fx, grant = transactions
+    assert buy.action == ActionType.BUY
+    assert buy.symbol == "NASDAQ:FOO"
+    assert buy.quantity == Decimal(10)
+    assert buy.amount == Decimal(-56)
+    assert buy.fees == Decimal(1)
+
+    assert sell.action == ActionType.SELL
+    assert sell.quantity == Decimal(5)
+    assert sell.amount == Decimal(30)
+    assert sell.fees == Decimal(0)
+
+    # FX price is derived from the GBP value.
+    assert fx.currency == "GBP"
+    assert fx.price == Decimal("0.8")
+    assert fx.quantity == Decimal(100)
+    assert fx.amount == Decimal(80)
+
+    assert grant.action == ActionType.STOCK_ACTIVITY
+    assert grant.amount is None
+
+
+def test_parse_trade_report_with_minimal_header(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Parse a trade without unused or conditionally required columns."""
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [
+            ["Market", "Code", "Type", "Date", "Quantity", "Price *", "Currency"],
+            ["LSE", "ABC", "Buy", "01/02/2023", "2", "10", "GBP"],
+        ],
+    )
+
+    [transaction] = SharesightParser().load_from_dir(tmp_path)
+
+    assert transaction.symbol == "LSE:ABC"
+    assert transaction.description == ""
+    assert transaction.fees == Decimal(0)
+    assert transaction.amount == Decimal(-20)
+    assert "Stock Activity markers cannot be detected" in caplog.text
+
+
+def test_parse_trade_report_with_renamed_columns(tmp_path: Path) -> None:
+    """Parse the report generation that renamed three legacy headings."""
+    renamed_header = [
+        "Price" if column == "Price *" else column for column in TRADE_HEADER
+    ]
+    renamed_header[renamed_header.index("Brokerage *")] = "Brokerage"
+    renamed_header[renamed_header.index("Currency")] = "Brokerage Currency"
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [
+            renamed_header,
+            [
+                "LSE",
+                "ABC",
+                "Example",
+                "Buy",
+                "01/02/2023",
+                "2",
+                "10",
+                "1",
+                "GBP",
+                "1",
+                "20",
+                "",
+            ],
+        ],
+    )
+
+    [transaction] = SharesightParser().load_from_dir(tmp_path)
+
+    assert transaction.symbol == "LSE:ABC"
+    assert transaction.currency == "GBP"
+    assert transaction.quantity == Decimal(2)
+    assert transaction.price == Decimal(10)
+    assert transaction.fees == Decimal(1)
+    assert transaction.amount == Decimal(-21)
+
+
+def test_parse_trade_report_with_newer_aliases(tmp_path: Path) -> None:
+    """Parse the newer aliases and ignore an unrelated report column."""
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [
+            [*ALIASED_TRADE_HEADER, "Unused report column"],
+            [
+                "ABC",
+                "NASDAQ",
+                "Example",
+                "01/02/2023",
+                "Sell",
+                "-2",
+                "10",
+                "USD",
+                "1",
+                "USD",
+                "1.2",
+                "16.67",
+                "",
+                "not used",
+            ],
+        ],
+    )
+
+    [transaction] = SharesightParser().load_from_dir(tmp_path)
+
+    assert transaction.symbol == "NASDAQ:ABC"
+    assert transaction.currency == "USD"
+    assert transaction.quantity == Decimal(2)
+    assert transaction.price == Decimal(10)
+    assert transaction.fees == Decimal(1)
+    assert transaction.amount == Decimal(19)
+
+
+def test_parse_trade_report_with_foreign_brokerage(tmp_path: Path) -> None:
+    """Reject brokerage whose currency differs from the instrument currency."""
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [
+            ALIASED_TRADE_HEADER,
+            [
+                "ABC",
+                "NASDAQ",
+                "Example",
+                "01/02/2023",
+                "Buy",
+                "2",
+                "10",
+                "USD",
+                "1",
+                "GBP",
+                "1.2",
+                "16.67",
+                "",
+            ],
+        ],
+    )
+
+    with pytest.raises(
+        ParsingError,
+        match="Brokerage Currency 'GBP' differs from transaction currency 'USD'",
+    ) as excinfo:
+        SharesightParser().load_from_dir(tmp_path)
+
+    assert excinfo.value.row_index == 2
+
+
+def test_parse_fx_trade_with_gbp_brokerage(tmp_path: Path) -> None:
+    """Accept an FX row whose brokerage is in GBP, the currency FX rows use."""
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [
+            ALIASED_TRADE_HEADER,
+            [
+                "USDGBP",
+                "FX",
+                "FX trade",
+                "03/02/2023",
+                "Sell",
+                "-100",
+                "1.25",
+                "USD",
+                "1",
+                "GBP",
+                "1.25",
+                "80",
+                "fx",
+            ],
+        ],
+    )
+
+    [transaction] = SharesightParser().load_from_dir(tmp_path)
+
+    assert transaction.symbol == "FX:USDGBP"
+    assert transaction.currency == "GBP"
+    assert transaction.quantity == Decimal(100)
+    assert transaction.price == Decimal("0.8")
+    assert transaction.fees == Decimal(1)
+    assert transaction.amount == Decimal(79)
+
+
+def test_parse_trade_report_unknown_action(tmp_path: Path) -> None:
+    """Raise on unknown trade types with row context."""
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [
+            TRADE_HEADER,
+            [
+                "NASDAQ",
+                "FOO",
+                "Foo Inc",
+                "Split",
+                "01/02/2023",
+                "10",
+                "5.5",
+                "1",
+                "USD",
+                "1",
+                "44",
+                "",
+            ],
+        ],
+    )
+
+    with pytest.raises(ParsingError, match="Unknown action: Split") as excinfo:
+        SharesightParser().load_from_dir(tmp_path)
+
+    assert excinfo.value.row_index == 2
+
+
+def test_parse_trade_report_refuses_a_line_of_spaces_in_the_trades(
+    tmp_path: Path,
+) -> None:
+    """Only an empty row ends the trades list, so the trade below is not dropped."""
+    trade = ["NASDAQ", "FOO", "Foo Inc", "Buy", "01/02/2023", "10", "5.5", "1"]
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [TRADE_HEADER, ["   "], [*trade, "USD", "1", "44", ""]],
+    )
+
+    with pytest.raises(
+        ParsingError, match=f"This row has 1 columns, not {len(TRADE_HEADER)}"
+    ) as excinfo:
+        SharesightParser().load_from_dir(tmp_path)
+
+    assert excinfo.value.row_index == 2
+
+
+@pytest.mark.parametrize(
+    ("extra", "blank", "below"),
+    [
+        pytest.param([], [], "Buy", id="a buy below an empty line"),
+        # A column added on the left moves Type, which is found from the header.
+        pytest.param(
+            ["Portfolio"],
+            [""] * (len(TRADE_HEADER) + 1),
+            "Sell",
+            id="a sale below a line of commas",
+        ),
+    ],
+)
+def test_parse_trade_report_refuses_a_trade_below_a_blank_row(
+    tmp_path: Path, extra: list[str], blank: list[str], below: str
+) -> None:
+    """A blank row ends the trades list, so a trade under one would be left out."""
+    trade = ["NASDAQ", "FOO", "Foo Inc", "Buy", "01/02/2023", "10", "5.5", "1"]
+    trade += ["USD", "1", "44", ""]
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [
+            [*extra, *TRADE_HEADER],
+            [*extra, *trade],
+            blank,
+            [*extra, *trade[:3], below, *trade[4:]],
+        ],
+    )
+
+    with pytest.raises(
+        ParsingError, match="below the blank row 3, where the trades list ends"
+    ) as excinfo:
+        SharesightParser().load_from_dir(tmp_path)
+
+    assert excinfo.value.row_index == 4
+
+
+def test_parse_trade_report_ignores_short_rows_below_the_trades(
+    tmp_path: Path,
+) -> None:
+    """A footnote or an empty line under the list is narrower than the table."""
+    trade = ["NASDAQ", "FOO", "Foo Inc", "Buy", "01/02/2023", "10", "5.5", "1"]
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [
+            TRADE_HEADER,
+            [*trade, "USD", "1", "44", ""],
+            [],
+            # As wide as the columns to the left of Type, and no wider.
+            ["* Prices and brokerage are specified in market currency.", "", ""],
+            [],
+        ],
+    )
+
+    assert len(SharesightParser().load_from_dir(tmp_path)) == 1
+
+
+def test_parse_trade_report_fx_without_value(tmp_path: Path) -> None:
+    """Raise on FX trades without a GBP value."""
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [
+            TRADE_HEADER,
+            [
+                "FX",
+                "USDGBP",
+                "FX trade",
+                "Sell",
+                "03/02/2023",
+                "-100",
+                "1.25",
+                "0",
+                "USD",
+                "1.25",
+                "",
+                "fx",
+            ],
+        ],
+    )
+
+    with pytest.raises(ParsingError, match="Missing Value in FX transaction"):
+        SharesightParser().load_from_dir(tmp_path)
+
+
+def test_parse_trade_report_fx_without_value_column(tmp_path: Path) -> None:
+    """Require the conditionally used Value column for an FX trade."""
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [
+            ["Market", "Code", "Type", "Date", "Quantity", "Price *", "Currency"],
+            ["FX", "USDGBP", "Sell", "03/02/2023", "-100", "1.25", "USD"],
+        ],
+    )
+
+    with pytest.raises(ParsingError, match="Missing Value in FX transaction"):
+        SharesightParser().load_from_dir(tmp_path)
+
+
+def test_parse_trade_report_invalid_stock_activity(tmp_path: Path) -> None:
+    """Raise when stock activity is not a buy."""
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [
+            TRADE_HEADER,
+            [
+                "NASDAQ",
+                "NVDA",
+                "Nvidia",
+                "Sell",
+                "04/02/2023",
+                "-2",
+                "100",
+                "0",
+                "USD",
+                "1",
+                "",
+                "Stock Activity vest",
+            ],
+        ],
+    )
+
+    with pytest.raises(InvalidTransactionError, match="must have Type=Buy"):
+        SharesightParser().load_from_dir(tmp_path)
+
+
+def _foo_purchase(day: str, quantity: str, comment: str = "") -> list[str]:
+    """Return a purchase of FOO at 5.50 USD a share with 1 USD of brokerage."""
+    return [
+        "NASDAQ",
+        "FOO",
+        "Foo Inc",
+        "Buy",
+        day,
+        quantity,
+        "5.5",
+        "1",
+        "USD",
+        "1",
+        "",
+        comment,
+    ]
+
+
+def test_load_from_dir_refuses_a_second_copy_of_the_trades_report(
+    tmp_path: Path,
+) -> None:
+    """The sample reports with the trades report downloaded twice stop the load.
+
+    The browser added " (1)" to the second download, so it is read first. The
+    report is then refused at its oldest trade, the purchase of 1 August 2019
+    on line 4 of both.
+    """
+    inputs = Path("tests/sharesight/data/inputs")
+    report = tmp_path / "All Trades Report.csv"
+    copy = tmp_path / "All Trades Report (1).csv"
+    shutil.copy(inputs / "All Trades Report - Test.csv", report)
+    shutil.copy(inputs / "All Trades Report - Test.csv", copy)
+    shutil.copy(
+        inputs / "Taxable Income Report - Test.csv",
+        tmp_path / "Taxable Income Report.csv",
+    )
+
+    with pytest.raises(
+        ParsingError, match="Two files in the directory hold this transaction"
+    ) as excinfo:
+        SharesightParser().load_from_dir(tmp_path)
+
+    message = str(excinfo.value)
+    assert message.startswith(f"While parsing {report}: ")
+    assert message.count("2019-08-01 Buy 1 FX:ETH") == 2
+    assert f"Sharesight, read from row 4 of {copy}\n" in message
+    assert f"Sharesight, read from row 4 of {report}\n" in message
+
+
+def test_load_from_dir_refuses_an_older_trades_report_left_beside_a_newer_one(
+    tmp_path: Path,
+) -> None:
+    """One trade that two exports state alike stops the load, and both are named.
+
+    All Trades is exported since inception, so a newer export repeats the
+    trades of an older one. Between these two exports the quantities of two
+    of the three purchases of 2 February were corrected, and a purchase dated
+    the day before was entered. Those read differently, or are in one file
+    only. The purchase of 10 was left alone: it is on line 3 of the older
+    export and line 4 of the newer one. A third report, with one purchase
+    that neither export has, is read before both.
+    """
+    _write_csv(
+        tmp_path / "All Trades Report - B.csv",
+        [TRADE_HEADER, _foo_purchase("06/02/2023", "7")],
+    )
+    older = tmp_path / "All Trades Report 2023.csv"
+    _write_csv(
+        older,
+        [
+            TRADE_HEADER,
+            _foo_purchase("02/02/2023", "3"),
+            _foo_purchase("02/02/2023", "10"),
+            _foo_purchase("02/02/2023", "4"),
+        ],
+    )
+    newer = tmp_path / "All Trades Report 2024.csv"
+    _write_csv(
+        newer,
+        [
+            TRADE_HEADER,
+            _foo_purchase("01/02/2023", "5"),
+            _foo_purchase("02/02/2023", "3.5"),
+            _foo_purchase("02/02/2023", "10"),
+            _foo_purchase("02/02/2023", "4.5"),
+        ],
+    )
+
+    with pytest.raises(
+        ParsingError, match="Two files in the directory hold this transaction"
+    ) as excinfo:
+        SharesightParser().load_from_dir(tmp_path)
+
+    message = str(excinfo.value)
+    assert message.startswith(f"While parsing {newer}: ")
+    assert message.count("2023-02-02 Buy 10 NASDAQ:FOO") == 2
+    assert f"Sharesight, read from row 3 of {older}\n" in message
+    assert f"Sharesight, read from row 4 of {newer}\n" in message
+
+
+def test_load_from_dir_reads_reports_with_no_trade_in_common(tmp_path: Path) -> None:
+    """Trades that differ in one thing only are two trades, and both load.
+
+    The two purchases of 2 February differ only in their quantity, and the
+    two of 3 February only in their comment.
+    """
+    _write_csv(
+        tmp_path / "All Trades Report - A.csv",
+        [
+            TRADE_HEADER,
+            _foo_purchase("02/02/2023", "10"),
+            _foo_purchase("03/02/2023", "20"),
+        ],
+    )
+    _write_csv(
+        tmp_path / "All Trades Report - B.csv",
+        [
+            TRADE_HEADER,
+            _foo_purchase("02/02/2023", "11"),
+            _foo_purchase("03/02/2023", "20", comment="second account"),
+        ],
+    )
+
+    transactions = SharesightParser().load_from_dir(tmp_path)
+
+    assert [
+        (transaction.quantity, transaction.description) for transaction in transactions
+    ] == [
+        (Decimal(10), ""),
+        (Decimal(11), ""),
+        (Decimal(20), ""),
+        (Decimal(20), "second account"),
+    ]
+
+
+def test_load_from_dir_counts_each_of_two_matching_rows_in_one_file(
+    tmp_path: Path,
+) -> None:
+    """A dividend listed twice in one report is two payments, each with its tax."""
+    dividend = ["XYZ", "X Corp", "03/04/2023", "1.2", "USD", "85", "15", "100", ""]
+    _write_csv(
+        tmp_path / "Taxable Income Report.csv",
+        [["Foreign Income"], FOREIGN_DIVIDEND_HEADER, dividend, dividend, ["Total"]],
+    )
+    _write_csv(
+        tmp_path / "All Trades Report.csv",
+        [TRADE_HEADER, _foo_purchase("02/02/2023", "10")],
+    )
+
+    transactions = SharesightParser().load_from_dir(tmp_path)
+
+    # The purchase costs 10 shares at 5.50 and 1 of brokerage, 56 in all.
+    assert [
+        (transaction.action, transaction.amount) for transaction in transactions
+    ] == [
+        (ActionType.BUY, Decimal(-56)),
+        (ActionType.DIVIDEND, Decimal(100)),
+        (ActionType.DIVIDEND_TAX, Decimal(-15)),
+        (ActionType.DIVIDEND, Decimal(100)),
+        (ActionType.DIVIDEND_TAX, Decimal(-15)),
+    ]

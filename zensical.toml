@@ -1,0 +1,119 @@
+[project]
+site_name = "UK Capital Gains Calculator"
+site_url = "https://cgt-calc.uk/"
+site_description = "Calculate UK capital gains from your investment transaction history and generate a detailed PDF report."
+site_author = "Ruslan Sayfutdinov"
+strict = true
+repo_url = "https://github.com/cgt-calc/capital-gains-calculator"
+repo_name = "cgt-calc/capital-gains-calculator"
+edit_uri = "edit/main/docs/"
+
+nav = [
+  { "Home" = [
+    "index.md",
+    { "Getting started" = [
+      { "Installation" = "installation.md" },
+      { "Generate a report" = "usage.md" },
+      { "Tax estimates" = "tax-estimates.md" },
+      { "Docker" = "docker.md" },
+    ] },
+    { "Privacy & disclaimer" = "privacy.md" },
+    { "Reporting problems" = "reporting-problems.md" },
+  ] },
+  { "Brokers & data" = [
+    { "Brokers" = [
+      "brokers/index.md",
+      { "Charles Schwab" = "brokers/schwab.md" },
+      { "Freetrade" = "brokers/freetrade.md" },
+      { "Hargreaves Lansdown" = "brokers/hargreaves-lansdown.md" },
+      { "Interactive Brokers" = "brokers/interactive-brokers.md" },
+      { "Morgan Stanley" = "brokers/morgan-stanley.md" },
+      { "Revolut" = "brokers/revolut.md" },
+      { "Sharesight" = "brokers/sharesight.md" },
+      { "Trading 212" = "brokers/trading212.md" },
+      { "Vanguard" = "brokers/vanguard.md" },
+      # The generic fallback belongs after the named brokers.
+      { "RAW format" = "brokers/raw.md" },
+    ] },
+    { "Offshore funds (ERI)" = "offshore-funds.md" },
+    { "Custom ERI data" = "custom-eri-data.md" },
+    { "Extra data and options" = "extra-data-and-options.md" },
+  ] },
+  { "Development" = [
+    { "Contributing" = "development/contributing.md" },
+    { "Adding a broker" = "development/adding-a-broker.md" },
+    { "Contributing ERI data" = "development/eri-data.md" },
+    { "Release process" = "development/releasing.md" },
+  ] },
+]
+
+extra_css = ["stylesheets/extra.css"]
+
+# Keep bookmarks and links to moved or combined sections working.
+[project.plugins.redirects.redirect_maps]
+"usage.md#tax-at-the-basic-and-higher-rate" = "tax-estimates.md#tax-at-the-basic-and-higher-rate"
+"usage.md#estimate-the-tax-from-your-income" = "tax-estimates.md#estimate-the-tax-from-your-income"
+"development/contributing.md#add-a-new-runtime-dependency" = "development/contributing.md#managing-dependencies"
+"development/contributing.md#add-a-development-dependency" = "development/contributing.md#managing-dependencies"
+"development/contributing.md#upgrade-existing-dependencies" = "development/contributing.md#managing-dependencies"
+"development/contributing.md#manual-changes" = "development/contributing.md#managing-dependencies"
+
+[project.theme]
+variant = "modern"
+language = "en"
+logo = "assets/logo.svg"
+favicon = "assets/favicon.png"
+features = [
+  "content.action.edit",
+  "content.code.copy",
+  "content.tooltips",
+  "navigation.expand",
+  "navigation.footer",
+  "navigation.indexes",
+  "navigation.instant",
+  "navigation.instant.prefetch",
+  "navigation.path",
+  "navigation.tabs",
+  "navigation.top",
+  "navigation.tracking",
+  "search.highlight",
+  "toc.follow",
+]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to system preference"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/cgt-calc/capital-gains-calculator"
+name = "GitHub repository"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/python"
+link = "https://pypi.org/project/cgt-calc/"
+name = "cgt-calc on PyPI"
+
+[project.markdown_extensions]
+admonition = {}
+tables = {}
+toc.permalink = true
+pymdownx.highlight.pygments_lang_class = true
+pymdownx.superfences = {}

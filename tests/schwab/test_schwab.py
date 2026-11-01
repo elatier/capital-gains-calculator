@@ -1,75 +1,244 @@
 """Test Schwab parser."""
 
+import datetime as dt
+from decimal import Decimal
+import io
 from pathlib import Path
-import subprocess
 
 import pytest
 
-from tests.utils import build_cmd
+from cgt_calc.exceptions import ParsingError, SymbolMissingError
+from cgt_calc.model import ActionType, BrokerTransaction
+from cgt_calc.parsers.schwab import AwardPrices, SchwabParser, action_from_str
+from tests.schwab.helpers import load_via_cli
+from tests.utils import (
+    assert_stdout_matches,
+    build_cmd,
+    report_path,
+    run_cli,
+    stderr_alerts,
+)
 
 
-def test_run_with_schwab_example_2023_files() -> None:
+def test_missing_award_file_reports_the_vest_it_cannot_price() -> None:
+    """A vest without a price is the only thing the award file is needed for.
+
+    The runs below parse files that never need it and stay silent; this one
+    reaches a Stock Plan Activity row and has nothing to price it with.
+    """
+    path = Path("tests") / "schwab" / "data" / "rsu_settlement" / "transactions.csv"
+    SchwabParser.awards_prices = AwardPrices(award_prices={})
+
+    with (
+        path.open(encoding="utf-8") as csv_file,
+        pytest.raises(ParsingError) as exc_info,
+    ):
+        SchwabParser.read_transactions(csv_file, path)
+
+    message = str(exc_info.value)
+    assert "no Schwab Award file was provided" in message
+    assert "--schwab-award-file" in message
+    # The row that needs the file is named, so it can be found in the statement.
+    assert "BAR" in message
+    assert "2023-08-18" in message
+
+
+def _read_award_file(award_file: Path) -> AwardPrices:
+    """Read an award-price CSV the way --schwab-award-file does."""
+    load_via_cli(schwab_award_file=str(award_file))
+    return SchwabParser.awards_prices
+
+
+def test_award_rows_overlapping_in_a_column_are_reported(tmp_path: Path) -> None:
+    """A split award row whose halves both fill a column is malformed input."""
+    award_file = tmp_path / "awards.csv"
+    award_file.write_text(
+        "Date,Action,Symbol,Description,Quantity,FeesAndCommissions,"
+        "DisbursementElection,Amount,AwardDate,AwardId,FairMarketValuePrice,"
+        "SalePrice,SharesSoldWithheldForTaxes,NetSharesDeposited,Taxes\n"
+        "08/15/2023,Lapse,BAR,Restricted Stock Lapse,400,,,,,,,,,,\n"
+        ',,,,400,,,,03/21/2022,101883189,$140.35,,200,200,"$13,192.90"\n'
+    )
+
+    with pytest.raises(ParsingError, match="contain data in column 5") as exc_info:
+        _read_award_file(award_file)
+
+    assert exc_info.value.row_index == 2
+
+
+@pytest.mark.parametrize("price", ["NaN", "$Infinity", "$not-a-number"])
+def test_award_price_that_is_not_a_finite_amount_is_reported(
+    tmp_path: Path, price: str
+) -> None:
+    """An unreadable award price names the file and row, not a late traceback.
+
+    The award file is read outside the CSV parser, so a bad price used to
+    reach the matching engine and fail there with nothing to point at.
+    """
+    award_file = tmp_path / "awards.csv"
+    award_file.write_text(
+        "Date,Action,Symbol,Description,Quantity,FeesAndCommissions,"
+        "DisbursementElection,Amount,AwardDate,AwardId,FairMarketValuePrice,"
+        "SalePrice,SharesSoldWithheldForTaxes,NetSharesDeposited,Taxes\n"
+        "08/15/2023,Lapse,BAR,Restricted Stock Lapse,400,,,,,,,,,,\n"
+        f',,,,,,,,03/21/2022,101883189,{price},,200,200,"$13,192.90"\n'
+    )
+
+    with pytest.raises(
+        ParsingError, match="Invalid decimal in column 'FairMarketValuePrice'"
+    ) as exc_info:
+        _read_award_file(award_file)
+
+    # The price is stated on the lower half of the split award row, so the
+    # row to correct is 3: row 1 is the header and row 2 holds the upper half.
+    assert exc_info.value.row_index == 3
+
+
+def test_award_price_with_thousands_separators_is_parsed(tmp_path: Path) -> None:
+    """Schwab groups prices over 999 with commas, such as $1,250.00."""
+    award_file = tmp_path / "awards.csv"
+    award_file.write_text(
+        "Date,Action,Symbol,Description,Quantity,FeesAndCommissions,"
+        "DisbursementElection,Amount,AwardDate,AwardId,FairMarketValuePrice,"
+        "SalePrice,SharesSoldWithheldForTaxes,NetSharesDeposited,Taxes\n"
+        "08/15/2023,Lapse,BAR,Restricted Stock Lapse,400,,,,,,,,,,\n"
+        ',,,,,,,,03/21/2022,101883189,"$1,250.00",,200,200,"$13,192.90"\n'
+    )
+
+    awards = _read_award_file(award_file)
+
+    assert awards.award_prices[dt.date(2023, 8, 15)]["BAR"] == Decimal("1250.00")
+
+
+def test_each_award_in_a_price_csv_keeps_its_own_price(tmp_path: Path) -> None:
+    """An award is two rows, and the price on the second belongs to the first above it."""
+    award_file = tmp_path / "awards.csv"
+    award_file.write_text(
+        "Date,Action,Symbol,Description,Quantity,FeesAndCommissions,"
+        "DisbursementElection,Amount,AwardDate,AwardId,FairMarketValuePrice,"
+        "SalePrice,SharesSoldWithheldForTaxes,NetSharesDeposited,Taxes\n"
+        "08/15/2023,Lapse,BAR,Restricted Stock Lapse,400,,,,,,,,,,\n"
+        ',,,,,,,,03/21/2022,101883189,$140.35,,200,200,"$13,192.90"\n'
+        "11/15/2023,Lapse,BAR,Restricted Stock Lapse,100,,,,,,,,,,\n"
+        ',,,,,,,,03/21/2022,101883189,$150.10,,50,50,"$3,752.50"\n'
+    )
+
+    awards = _read_award_file(award_file)
+
+    assert awards.award_prices == {
+        dt.date(2023, 8, 15): {"BAR": Decimal("140.35")},
+        dt.date(2023, 11, 15): {"BAR": Decimal("150.10")},
+    }
+
+
+def test_award_file_without_the_award_says_so() -> None:
+    """A file that lacks this particular award is a different mistake."""
+    path = Path("tests") / "schwab" / "data" / "rsu_settlement" / "transactions.csv"
+    SchwabParser.awards_prices = AwardPrices(
+        award_prices={dt.date(2020, 1, 1): {"FOO": Decimal(1)}}
+    )
+
+    with (
+        path.open(encoding="utf-8") as csv_file,
+        pytest.raises(ParsingError) as exc_info,
+    ):
+        SchwabParser.read_transactions(csv_file, path)
+
+    assert "has no award price for it" in str(exc_info.value)
+
+
+def test_a_schwab_symbol_is_not_given_a_london_fund_s_income(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """A Schwab symbol is a US one, never a London ticker spelt the same.
+
+    SPLG was the SPDR fund's US symbol, and is also the London ticker of an
+    Irish Invesco fund whose excess reported income cgt-calc holds. A Schwab
+    SPLG holding kept across that fund's 31 December 2023 reporting date is
+    not the fund: none of its income is reported, and its dividend is not
+    an Irish one, which would warn that Ireland has no treaty rate here.
+    """
+    history = tmp_path / "transactions.csv"
+    history.write_text(
+        '"Date","Action","Symbol","Description","Quantity","Price","Fees & Comm","Amount"\n'
+        '"07/31/2024","Sell","SPLG","SPDR PORTFOLIO S&P 500 ETF","100","$60.00","","$6000.00"\n'
+        '"06/27/2024","NRA Tax Adj","SPLG","SPDR PORTFOLIO S&P 500 ETF","","","","-$3.00"\n'
+        '"06/27/2024","Qualified Dividend","SPLG","SPDR PORTFOLIO S&P 500 ETF","","","","$20.00"\n'
+        '"10/09/2023","Buy","SPLG","SPDR PORTFOLIO S&P 500 ETF","100","$50.00","","-$5000.00"\n'
+        '"10/09/2023","Wire Funds Received","","WIRED FUNDS RECEIVED","","","","$5000.00"\n',
+        encoding="utf-8",
+    )
+
+    result = run_cli(
+        build_cmd(
+            "--year",
+            "2024",
+            "--schwab-file",
+            str(history),
+            "--output",
+            report_path(request),
+        )
+    )
+
+    assert stderr_alerts(result.stderr) == []
+    assert "Disposals:                  1" in result.stdout
+    assert "Excess Reported Income" not in result.stdout
+
+
+def test_equity_award_rows_are_us_symbols_too() -> None:
+    """A complete Equity Awards export is stamped like the main history."""
+    transactions = load_via_cli(
+        schwab_award_file="tests/schwab/data/equity_award/schwab_equity_award_v2.json"
+    )
+
+    assert {transaction.market for transaction in transactions} == {"US"}
+
+
+def test_run_with_schwab_example_2023_files(request: pytest.FixtureRequest) -> None:
     """Runs the script and verifies it doesn't fail."""
     cmd = build_cmd(
         "--year",
         "2023",
         "--schwab-file",
         "tests/schwab/data/2023/transactions.csv",
+        "--output",
+        report_path(request),
     )
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode:
-        pytest.fail(
-            "Integration test failed\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
-    stderr_lines = result.stderr.strip().split("\n")
-    assert len(stderr_lines) == 1
-    assert stderr_lines[0] == "WARNING: No Schwab Award file provided"
+    result = run_cli(cmd)
+    assert stderr_alerts(result.stderr) == [], "Unexpected stderr message"
     expected_file = Path("tests") / "schwab" / "data" / "2023" / "expected_output.txt"
-    expected = expected_file.read_text()
-    cmd_str = " ".join([param if param else "''" for param in cmd])
-    assert result.stdout == expected, (
-        "Run with example files generated unexpected outputs, "
-        "if you added new features update the test with:\n"
-        f"{cmd_str} > {expected_file}"
-    )
+    assert_stdout_matches(result, cmd, expected_file)
 
 
-def test_run_with_schwab_cash_merger_files() -> None:
+def test_run_with_schwab_cash_merger_files(request: pytest.FixtureRequest) -> None:
     """Runs the script and verifies it doesn't fail."""
     cmd = build_cmd(
         "--year",
         "2020",
         "--schwab-file",
         "tests/schwab/data/cash_merger/transactions.csv",
+        "--output",
+        report_path(request),
     )
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode:
-        pytest.fail(
-            "Integration test failed\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
-    stderr_lines = result.stderr.strip().split("\n")
-    expected_lines = 2
-    assert len(stderr_lines) == expected_lines
-    assert stderr_lines[0] == "WARNING: No Schwab Award file provided"
-    assert stderr_lines[1].startswith("WARNING: Cash Merger support is not complete")
+    result = run_cli(cmd)
+    alerts = stderr_alerts(result.stderr)
+    assert len(alerts) == 1
+    assert alerts[0].startswith("WARNING: Cash Merger support is not complete")
+    assert "FOO: 100 units on 2021-03-02 for 1000 USD (Charles Schwab)" in result.stderr
     expected_file = (
         Path("tests") / "schwab" / "data" / "cash_merger" / "expected_output.txt"
     )
-    expected = expected_file.read_text()
-    cmd_str = " ".join([param if param else "''" for param in cmd])
-    assert result.stdout == expected, (
-        "Run with example files generated unexpected outputs, "
-        "if you added new features update the test with:\n"
-        f"{cmd_str} > {expected_file}"
-    )
+    assert_stdout_matches(result, cmd, expected_file)
 
 
-def test_run_with_schwab_rsu_settlement_files() -> None:
-    """Runs the script and verifies it doesn't fail."""
+def test_run_with_schwab_rsu_settlement_files(request: pytest.FixtureRequest) -> None:
+    """Date a vest by the award, not by when Schwab posted it.
+
+    The 200 shares vest on 15 August and post on 18 August, the day the same
+    number is sold. Dated by the vest, they join the pool before the sale, so
+    the sale takes its cost from the pool rather than from the vest under the
+    same-day rule.
+    """
     cmd = build_cmd(
         "--year",
         "2023",
@@ -77,53 +246,349 @@ def test_run_with_schwab_rsu_settlement_files() -> None:
         "tests/schwab/data/rsu_settlement/transactions.csv",
         "--schwab-award-file",
         "tests/schwab/data/rsu_settlement/awards.csv",
+        "--output",
+        report_path(request),
     )
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode:
-        pytest.fail(
-            "Integration test failed\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
-    stderr = result.stderr.strip()
-    assert stderr == ""
+    result = run_cli(cmd)
+    assert stderr_alerts(result.stderr) == []
     expected_file = (
         Path("tests") / "schwab" / "data" / "rsu_settlement" / "expected_output.txt"
     )
-    expected = expected_file.read_text()
-    cmd_str = " ".join([param if param else "''" for param in cmd])
-    assert result.stdout == expected, (
-        "Run with example files generated unexpected outputs, "
-        "if you added new features update the test with:\n"
-        f"{cmd_str} > {expected_file}"
-    )
+    assert_stdout_matches(result, cmd, expected_file)
 
 
-def test_run_with_schwab_bond_interest_files() -> None:
+def test_run_with_schwab_bond_interest_files(request: pytest.FixtureRequest) -> None:
     """Test that Bond Interest and Credit Interest are classified as INTEREST."""
     cmd = build_cmd(
         "--year",
         "2023",
         "--schwab-file",
         "tests/schwab/data/bond_interest/transactions.csv",
+        "--output",
+        report_path(request),
     )
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode:
-        pytest.fail(
-            "Integration test failed\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
-    stderr_lines = result.stderr.strip().split("\n")
-    assert len(stderr_lines) == 1
-    assert stderr_lines[0] == "WARNING: No Schwab Award file provided"
+    result = run_cli(cmd)
+    assert stderr_alerts(result.stderr) == [], "Unexpected stderr message"
     expected_file = (
         Path("tests") / "schwab" / "data" / "bond_interest" / "expected_output.txt"
     )
-    expected = expected_file.read_text()
-    cmd_str = " ".join([param if param else "''" for param in cmd])
-    assert result.stdout == expected, (
-        "Run with example files generated unexpected outputs, "
-        "if you added new features update the test with:\n"
-        f"{cmd_str} > {expected_file}"
+    assert_stdout_matches(result, cmd, expected_file)
+
+
+def test_run_with_schwab_interest_tax_files(request: pytest.FixtureRequest) -> None:
+    """Runs the script on interest withholding data and checks the output."""
+    cmd = build_cmd(
+        "--year",
+        "2024",
+        "--schwab-file",
+        "tests/schwab/data/interest_tax/transactions.csv",
+        "--output",
+        report_path(request),
     )
+    result = run_cli(cmd)
+    assert stderr_alerts(result.stderr) == []
+    expected_file = (
+        Path("tests") / "schwab" / "data" / "interest_tax" / "expected_output.txt"
+    )
+    assert_stdout_matches(result, cmd, expected_file)
+
+
+SCHWAB_HEADER = "Date,Action,Symbol,Description,Price,Quantity,Fees & Comm,Amount\n"
+
+
+def _read(content: str) -> list[BrokerTransaction]:
+    """Parse a Schwab CSV from a string."""
+    return SchwabParser.read_transactions(
+        io.StringIO(content), Path("transactions.csv")
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "action"),
+    [
+        ("Buy", ActionType.BUY),
+        ("Sell", ActionType.SELL),
+        ("Sell to Open", ActionType.OPTION_GRANT),
+        ("Buy to Close", ActionType.OPTION_CLOSE),
+        ("Expired", ActionType.OPTION_EXPIRY),
+        ("Assigned", ActionType.OPTION_ASSIGNMENT),
+        ("Qualified Dividend", ActionType.DIVIDEND),
+        ("Cash Dividend", ActionType.DIVIDEND),
+        ("Qual Div Reinvest", ActionType.DIVIDEND),
+        ("Div Adjustment", ActionType.DIVIDEND),
+        ("Special Qual Div", ActionType.DIVIDEND),
+        ("Non-Qualified Div", ActionType.DIVIDEND),
+        ("NRA Tax Adj", ActionType.DIVIDEND_TAX),
+        ("NRA Withholding", ActionType.DIVIDEND_TAX),
+        ("NRA Withhold", ActionType.DIVIDEND_TAX),
+        ("Foreign Tax Paid", ActionType.DIVIDEND_TAX),
+        ("ADR Mgmt Fee", ActionType.ADJUSTMENT),
+        ("Adjustment", ActionType.ADJUSTMENT),
+        ("IRS Withhold Adj", ActionType.ADJUSTMENT),
+        ("Wire Funds Adj", ActionType.ADJUSTMENT),
+        ("Short Term Cap Gain", ActionType.CAPITAL_GAIN),
+        ("Long Term Cap Gain", ActionType.CAPITAL_GAIN),
+        ("Spin-off", ActionType.SPIN_OFF),
+        ("Credit Interest", ActionType.INTEREST),
+        ("Bond Interest", ActionType.INTEREST),
+        ("Reinvest Shares", ActionType.REINVEST_SHARES),
+        ("Reinvest Dividend", ActionType.REINVEST_DIVIDENDS),
+        ("Wire Funds Received", ActionType.WIRE_FUNDS_RECEIVED),
+        ("Stock Split", ActionType.STOCK_SPLIT),
+        ("Cash Merger", ActionType.CASH_MERGER),
+        ("Cash Merger Adj", ActionType.CASH_MERGER),
+        ("Full Redemption", ActionType.FULL_REDEMPTION),
+        ("Full Redemption Adj", ActionType.FULL_REDEMPTION),
+    ],
+)
+def test_action_from_str(label: str, action: ActionType) -> None:
+    """Map every known Schwab action label."""
+    assert action_from_str(label, Path("transactions.csv")) == action
+
+
+def test_action_from_str_unknown() -> None:
+    """Raise on unknown action labels."""
+    with pytest.raises(ParsingError, match="Unknown action"):
+        action_from_str("Dance", Path("transactions.csv"))
+
+
+def test_read_transactions_empty_file() -> None:
+    """Raise on empty transaction files."""
+    with pytest.raises(ParsingError, match="file is empty"):
+        _read("")
+
+
+@pytest.mark.parametrize("line", [",,,,,,,", "   "], ids=["commas", "spaces"])
+def test_read_transactions_skips_blank_lines(line: str) -> None:
+    """Skip a blank line and read the row below it."""
+    content = (
+        SCHWAB_HEADER
+        + f"{line}\n"
+        + '01/15/2023,Credit Interest,,Interest,,,,"$1.00"\n'
+    )
+
+    transactions = _read(content)
+
+    assert [transaction.date for transaction in transactions] == [dt.date(2023, 1, 15)]
+
+
+def test_read_transactions_wrong_column_count() -> None:
+    """Raise when a row has a different number of columns."""
+    content = SCHWAB_HEADER + "01/15/2023,Sell\n"
+    with pytest.raises(ParsingError) as excinfo:
+        _read(content)
+    assert excinfo.value.row_index == 2
+
+
+def test_read_transactions_as_of_date() -> None:
+    """Parse dates with an 'as of' suffix."""
+    content = (
+        SCHWAB_HEADER
+        + '01/15/2023 as of 01/12/2023,Credit Interest,,Interest,,,,"$1.00"\n'
+    )
+    transactions = _read(content)
+    assert transactions[0].date == dt.date(2023, 1, 15)
+
+
+def test_read_transactions_invalid_date() -> None:
+    """Raise on unparsable dates."""
+    content = SCHWAB_HEADER + "2023-01-15,Credit Interest,,Interest,,,,$1.00\n"
+    with pytest.raises(ParsingError, match="Invalid date format"):
+        _read(content)
+
+
+def test_read_transactions_ninth_column_must_be_empty() -> None:
+    """Raise when the legacy ninth column contains data."""
+    header = SCHWAB_HEADER.rstrip("\n") + ",Extra\n"
+    content = header + "01/15/2023,Credit Interest,,Interest,,,,$1.00,oops\n"
+    with pytest.raises(ParsingError, match="should be empty"):
+        _read(content)
+
+
+def test_stock_activity_without_symbol() -> None:
+    """Raise when a stock activity row has no symbol to price."""
+    content = SCHWAB_HEADER + "01/15/2023,Stock Plan Activity,,Vest,,10,,\n"
+    with pytest.raises(SymbolMissingError):
+        _read(content)
+
+
+def test_a_vest_posted_without_as_of_takes_the_award_date() -> None:
+    """A posting date with no 'as of' still gives way to the award's vest date."""
+    SchwabParser.awards_prices = AwardPrices(
+        award_prices={dt.date(2023, 8, 15): {"BAR": Decimal("140.35")}}
+    )
+    content = SCHWAB_HEADER + "08/18/2023,Stock Plan Activity,BAR,Vest,,200,,\n"
+
+    (vest,) = _read(content)
+
+    assert vest.date == dt.date(2023, 8, 15)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        pytest.param(
+            "08/18/2023,Buy,AAPL,APPLE INC,$150.00,10,$0.00,-$1500.00\n"
+            "08/18/2023,Stock Plan Activity,BAR,Vest,,200,,\n"
+            "08/18/2023,Cancel Buy,AAPL,APPLE INC,$150.00,10,$0.00,$0.00\n",
+            id="same day, buy listed above",
+        ),
+        pytest.param(
+            "08/21/2023,Cancel Buy,AAPL,APPLE INC,$150.00,10,$0.00,$0.00\n"
+            "08/18/2023,Stock Plan Activity,BAR,Vest,,200,,\n"
+            "08/17/2023,Buy,AAPL,APPLE INC,$150.00,10,$0.00,-$1500.00\n",
+            id="earlier buy listed below",
+        ),
+    ],
+)
+def test_a_vest_between_a_buy_and_its_cancellation_does_not_hide_the_buy(
+    rows: str,
+) -> None:
+    """The Cancel Buy search walks the dates the CSV states, not a vest's award date.
+
+    The vest is posted on 18 August but dated by its award, 15 August. Read by
+    that date it would end the search before it reaches the Buy, in either
+    direction the search looks.
+    """
+    SchwabParser.awards_prices = AwardPrices(
+        award_prices={dt.date(2023, 8, 15): {"BAR": Decimal("140.35")}}
+    )
+
+    (vest,) = _read(SCHWAB_HEADER + rows)
+
+    assert vest.symbol == "BAR"
+
+
+def test_cash_merger_adj_without_cash_merger() -> None:
+    """Raise when a Cash Merger Adj has no preceding Cash Merger."""
+    content = SCHWAB_HEADER + "01/15/2023,Cash Merger Adj,FOO,Merger,,-10,,\n"
+    with pytest.raises(ParsingError, match="must be preceded"):
+        _read(content)
+
+
+def test_cash_merger_adj_after_another_action() -> None:
+    """Report a malformed pair as input data, not an internal assertion."""
+    content = (
+        SCHWAB_HEADER
+        + "01/15/2023,Credit Interest,,Interest,,,,$1.00\n"
+        + "01/15/2023,Cash Merger Adj,FOO,Merger,,-10,,\n"
+    )
+
+    with pytest.raises(ParsingError, match="must immediately follow"):
+        _read(content)
+
+
+def test_full_redemption_adj_before_another_action() -> None:
+    """Report an unexpected second row as malformed broker data."""
+    content = (
+        SCHWAB_HEADER
+        + "01/15/2023,Full Redemption Adj,FOO,Redemption,,,,$100.00\n"
+        + "01/15/2023,Credit Interest,,Interest,,,,$1.00\n"
+    )
+
+    with pytest.raises(ParsingError, match="must be followed"):
+        _read(content)
+
+
+def test_invalid_cash_merger_pair() -> None:
+    """Raise when a Cash Merger pair fails validation."""
+    content = (
+        SCHWAB_HEADER
+        + '01/16/2023,Cash Merger,FOO,Merger,,,,"$100.00"\n'
+        + "01/15/2023,Cash Merger Adj,FOO,Merger,,-10,,\n"
+    )
+    with pytest.raises(
+        ParsingError, match="must have the same date, symbol and description"
+    ) as exc_info:
+        _read(content)
+
+    assert "FOO on 2023-01-16" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("amount", "quantity", "adj_price", "adj_fees"),
+    [
+        # Negative proceeds would make a disposal with a negative price.
+        ('"-$100.00"', "-10", "", ""),
+        # A positive quantity is not shares leaving the account.
+        ('"$100.00"', "10", "", ""),
+        # A price on the adjustment row is not part of the format.
+        ('"$100.00"', "-10", "5", ""),
+    ],
+)
+def test_cash_merger_pair_with_invalid_values(
+    amount: str, quantity: str, adj_price: str, adj_fees: str
+) -> None:
+    """Reject values that would corrupt the derived disposal."""
+    content = (
+        SCHWAB_HEADER
+        + f"01/15/2023,Cash Merger,FOO,Merger,,,,{amount}\n"
+        + f"01/15/2023,Cash Merger Adj,FOO,Merger,{adj_price},{quantity},{adj_fees},\n"
+    )
+
+    with pytest.raises(ParsingError, match="Invalid Cash Merger format"):
+        _read(content)
+
+
+@pytest.mark.parametrize(
+    ("amount", "quantity", "redemption_fees"),
+    [
+        ('"-$100.00"', "-10", ""),
+        ('"$100.00"', "10", ""),
+    ],
+)
+def test_full_redemption_pair_with_invalid_values(
+    amount: str, quantity: str, redemption_fees: str
+) -> None:
+    """Reject values that would corrupt the derived disposal."""
+    content = (
+        SCHWAB_HEADER
+        + f"01/15/2023,Full Redemption Adj,FOO,Redemption,,,,{amount}\n"
+        + f"01/15/2023,Full Redemption,FOO,Redemption,,{quantity},{redemption_fees},\n"
+    )
+
+    with pytest.raises(ParsingError, match="Invalid Full Redemption format"):
+        _read(content)
+
+
+def test_invalid_full_redemption_pair() -> None:
+    """Raise when a Full Redemption pair fails validation."""
+    content = (
+        SCHWAB_HEADER
+        + '01/16/2023,Full Redemption Adj,FOO,Redemption,,,,"$100.00"\n'
+        + "01/15/2023,Full Redemption,FOO,Redemption,,-10,,\n"
+    )
+    with pytest.raises(
+        ParsingError, match="must have the same date, symbol and description"
+    ) as exc_info:
+        _read(content)
+
+    assert "FOO on 2023-01-15" in str(exc_info.value)
+
+
+def test_cash_merger_rejects_zero_adjustment_quantity() -> None:
+    """A zero quantity identifies the malformed Cash Merger pair."""
+    content = (
+        SCHWAB_HEADER
+        + "01/15/2023,Cash Merger,FOO,Merger,,,,$100.00\n"
+        + "01/15/2023,Cash Merger Adj,FOO,Merger,,0,,\n"
+    )
+
+    with pytest.raises(ParsingError, match="negative share quantity") as exc_info:
+        _read(content)
+
+    assert "FOO on 2023-01-15" in str(exc_info.value)
+
+
+def test_full_redemption_rejects_zero_quantity() -> None:
+    """A zero quantity identifies the malformed Full Redemption pair."""
+    content = (
+        SCHWAB_HEADER
+        + "01/15/2023,Full Redemption Adj,FOO,Redemption,,,,$100.00\n"
+        + "01/15/2023,Full Redemption,FOO,Redemption,,0,,\n"
+    )
+
+    with pytest.raises(ParsingError, match="negative share quantity") as exc_info:
+        _read(content)
+
+    assert "FOO on 2023-01-15" in str(exc_info.value)

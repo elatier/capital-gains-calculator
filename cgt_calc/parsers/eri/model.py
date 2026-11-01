@@ -1,22 +1,22 @@
 """Model classes for ERI."""
 
-import datetime
+import datetime as dt
 from decimal import Decimal
 
-from cgt_calc.model import ActionType, BrokerTransaction
+from cgt_calc.model import ActionType, BrokerTransaction, CurrencyCode, Isin
 
 
-class EriTransaction(BrokerTransaction):
-    """Eri transaction data."""
+class ERITransaction(BrokerTransaction):
+    """ERI transaction data."""
 
     def __init__(
         self,
-        date: datetime.date,
-        isin: str,
+        date: dt.date,
+        isin: Isin,
         price: Decimal,
-        currency: str,
+        currency: CurrencyCode,
     ) -> None:
-        """Create an Eri transaction."""
+        """Create an ERI transaction."""
 
         super().__init__(
             date=date,

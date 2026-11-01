@@ -1,11 +1,17 @@
-"""Exceptions to different errors."""
+"""Exception types for the various error conditions."""
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import csv
+import io
 from typing import TYPE_CHECKING
 
+from .util import display_str, is_blank_row, strip_zeros
+
 if TYPE_CHECKING:
-    import datetime
+    from collections.abc import Generator, Sequence
+    import datetime as dt
     from decimal import Decimal
     from pathlib import Path
 
@@ -42,16 +48,51 @@ class ParsingError(CgtError):
         self._update_message()
 
 
-class UnsupportedBrokerActionError(ParsingError):
-    """Raised when a broker export contains an unsupported action."""
+@contextmanager
+def reading_as(encoding: str, file: Path) -> Generator[None]:
+    """Report text that is not in ``encoding`` as a parsing error naming the file.
 
-    def __init__(self, file: Path, broker: str, action: str):
-        """Initialise."""
-        message = (
-            f"Unsupported {broker} action '{action}'. "
-            "Please check if a newer version of cgt-calc adds support or open an issue."
-        )
-        super().__init__(file, message)
+    Text is decoded as it is read, not when the file is opened, so this wraps
+    the reading rather than the ``open`` call.
+    """
+    try:
+        yield
+    except UnicodeDecodeError as err:
+        name = "UTF-8" if encoding.lower().startswith("utf") else encoding.title()
+        # The stdin marker, args_validators.STDIN_PATH, which cannot be
+        # imported here without a cycle.
+        if str(file) == "-":
+            detail = (
+                f"standard input is not {name} text. What is piped or redirected "
+                f"into it must be {name}."
+            )
+        else:
+            detail = (
+                f"this file is not {name} text. Save it as {name}, or use the "
+                "original file if another program re-saved it."
+            )
+        raise ParsingError(file, detail) from err
+
+
+@contextmanager
+def saving(what: str, file: Path, instead: str) -> Generator[None]:
+    """Report a failure to write `file` as a message; `instead` is the way round it."""
+    try:
+        yield
+    except OSError as err:
+        raise CgtError(
+            f"Cannot save {what} to {file}: {err.strerror}. Close the file if "
+            "another program has it open, and check that it and its folder can be "
+            f"written to. {instead}"
+        ) from err
+
+
+def without_file(option: str) -> str:
+    """Say how to run without a file that `option` names and cgt-calc saves."""
+    return (
+        f"To run without reading or saving this file, pass {option}= with nothing "
+        "after the = sign."
+    )
 
 
 class UnsupportedBrokerCurrencyError(ParsingError):
@@ -69,9 +110,97 @@ class InvalidTransactionError(CgtError):
     """Invalid transaction error."""
 
     def __init__(self, transaction: BrokerTransaction, message: str):
-        """Initialise."""
+        """Initialise with a message that is a complete sentence.
+
+        The transaction is printed on the lines beneath it. A fixed connecting
+        phrase used to be appended instead, so every message had to end
+        mid-sentence, and a message of several sentences had the phrase
+        joined onto its last instruction.
+        """
         self.transaction = transaction
-        self.message = f"{message} for the following transaction:\n{transaction}"
+        self.message = f"{message}\n{transaction}"
+        super().__init__(self.message)
+
+
+class UnclassifiedGiftError(CgtError):
+    """Raised when a broker reports a gift of shares without saying who got them.
+
+    Deliberately not an InvalidTransactionError: the transaction is perfectly
+    valid and the message already names it, so dumping the row on the end only
+    buries the instructions.
+    """
+
+    def __init__(self, transaction: BrokerTransaction, readings: list[Decimal]):
+        """Initialise.
+
+        `readings` holds every share count the row could be stating. There is
+        normally one; a count printed before a stock split can be two, where
+        the export does not say whether it was restated.
+        """
+        self.transaction = transaction
+        rows = "\n".join(
+            f"  {transaction.date},TRANSFER_TO_SPOUSE,{transaction.symbol},"
+            f"{strip_zeros(reading)},0.00,0.00,{transaction.currency}"
+            for reading in readings
+        )
+        gift_rows = "\n".join(
+            f"  {transaction.date},GIFT,{transaction.symbol},"
+            f"{strip_zeros(reading)},<value per unit>,0.00,"
+            f"{transaction.currency}"
+            for reading in readings
+        )
+        gift = (
+            f"{strip_zeros(readings[0])} units of {transaction.symbol}"
+            if len(readings) == 1
+            else f"{transaction.symbol} shares"
+        )
+        spouse = (
+            "If you gave them to a spouse or civil partner and the transfer "
+            "qualifies under TCGA 1992 s58 (normally living together in that "
+            "tax year, or within the window after separating), it is a no "
+            "gain/no loss transfer."
+        )
+        if len(readings) == 1:
+            how = (
+                f"{spouse} Put this line in a CSV and pass it with --raw-file "
+                "alongside the file you already use, and the gift is then taken "
+                f"as accounted for:\n{rows}"
+            )
+        else:
+            options = " or ".join(strip_zeros(reading) for reading in readings)
+            how = (
+                f"{spouse} You record that by putting a line in a CSV and "
+                "passing it with --raw-file alongside the file you already "
+                "use.\n"
+                "\n"
+                f"{transaction.symbol} split after this date and the export does "
+                "not say whether it restated the count, so the gift was either "
+                f"{options} shares. Check a statement to see which, and add that "
+                f"line:\n{rows}"
+            )
+        self.message = (
+            f"{transaction.broker} reported a gift of {gift} on "
+            f"{transaction.date}, but not who received them, and that decides "
+            "the tax.\n"
+            "\n"
+            f"{how}\n"
+            "\n"
+            "If they went to anyone else, it is a disposal at market value. Put "
+            "this line in the CSV instead, with the market value of the gift "
+            f"divided by its units as the price:\n{gift_rows}\n"
+            "Market value has its own rules (TCGA 1992 s272): for quoted "
+            "shares it follows the day's quoted prices, and unquoted shares "
+            "need an open-market valuation of the holding given away. If the "
+            "count has been restated for a later split, as Schwab's export "
+            "does, divide the value of the whole gift by the restated count.\n"
+            "A loss on it is clogged, since a loss on a gift to a connected "
+            "person can only be set against gains on disposals to the same "
+            "person while still connected (TCGA 1992 s18(3)). If the recipient "
+            "is not a connected person, write GIFT_UNCONNECTED instead and the "
+            "loss counts like any other.\n"
+            "\n"
+            "See https://cgt-calc.uk/brokers/raw/#transfers-to-a-spouse-or-civil-partner"
+        )
         super().__init__(self.message)
 
 
@@ -80,7 +209,7 @@ class AmountMissingError(InvalidTransactionError):
 
     def __init__(self, transaction: BrokerTransaction):
         """Initialise."""
-        super().__init__(transaction, "Amount missing")
+        super().__init__(transaction, "Amount missing.")
 
 
 class SymbolMissingError(InvalidTransactionError):
@@ -88,7 +217,7 @@ class SymbolMissingError(InvalidTransactionError):
 
     def __init__(self, transaction: BrokerTransaction):
         """Initialise."""
-        super().__init__(transaction, "Symbol missing")
+        super().__init__(transaction, "Symbol missing.")
 
 
 class PriceMissingError(InvalidTransactionError):
@@ -96,54 +225,108 @@ class PriceMissingError(InvalidTransactionError):
 
     def __init__(self, transaction: BrokerTransaction):
         """Initialise."""
-        super().__init__(transaction, "Price missing")
+        super().__init__(transaction, "Price missing.")
+
+
+class IsinMissingError(InvalidTransactionError):
+    """ISIN is missing error."""
+
+    def __init__(self, transaction: BrokerTransaction):
+        """Initialise."""
+        super().__init__(transaction, "ISIN missing.")
 
 
 class QuantityMissingError(InvalidTransactionError):
-    """Price is missing error."""
+    """Quantity is missing error."""
 
     def __init__(self, transaction: BrokerTransaction):
         """Initialise."""
-        super().__init__(transaction, "Quantity missing")
+        super().__init__(transaction, "Quantity missing.")
 
 
 class QuantityNotPositiveError(InvalidTransactionError):
-    """Quantity is negative error."""
+    """Quantity is not positive error."""
 
     def __init__(self, transaction: BrokerTransaction):
         """Initialise."""
-        super().__init__(transaction, "Positive quantity required")
+        super().__init__(transaction, "Positive quantity required.")
+
+
+def _as_csv(row: Sequence[str]) -> str:
+    """Print the row as a CSV line, not as a Python list."""
+    line = io.StringIO()
+    csv.writer(line).writerow(row)
+    return line.getvalue().rstrip("\r\n")
 
 
 class UnexpectedColumnCountError(ParsingError):
     """Unexpected column error."""
 
-    def __init__(self, row: list[str], count: int, file: Path):
+    def __init__(
+        self, row: list[str], count: int, file: Path, *, row_index: int | None = None
+    ):
         """Initialise."""
         super().__init__(
-            file, f"The following row doesn't have {count} columns:\n{row}"
+            file,
+            f"This row has {len(row)} columns, not {count}:\n  {_as_csv(row)}",
+            row_index=row_index,
+        )
+
+
+class UnexpectedHeaderError(ParsingError):
+    """A data file whose header line is not the one its reader expects."""
+
+    def __init__(
+        self,
+        header: Sequence[str],
+        expected: Sequence[str],
+        file: Path,
+        *,
+        row_index: int = 1,
+    ):
+        """Initialise with the line found where the header belongs.
+
+        The line is shown as Python quotes a string, so that a space at the
+        end of a name, or a character that cannot be seen, shows up.
+        """
+        found = " blank." if is_blank_row(header) else f":\n  {_as_csv(header)!r}"
+        super().__init__(
+            file,
+            f"This line must be the header '{_as_csv(expected)}', but it is{found}",
+            row_index=row_index,
         )
 
 
 class UnexpectedRowCountError(ParsingError):
-    """Unexpected row error."""
+    """An award-price CSV whose rows do not come in pairs."""
 
     def __init__(self, count: int, file: Path):
-        """Initialise."""
-        super().__init__(file, f"The following file doesn't have {count} rows:")
+        """Initialise with the number of rows found after the header."""
+        rows = "row" if count == 1 else "rows"
+        super().__init__(
+            file,
+            f"This file has {count} {rows} after its header, an odd number. The "
+            "award-price CSV layout cgt-calc supports stores each activity across "
+            "two rows, the second continuing the first, so a row is missing or "
+            "extra, or the file is in a layout cgt-calc does not support. Export "
+            "the file from Schwab again and pass it unchanged.",
+        )
 
 
 class CalculatedAmountDiscrepancyError(InvalidTransactionError):
     """Calculated amount discrepancy error."""
 
-    def __init__(self, transaction: BrokerTransaction, calculated_amount: Decimal):
+    def __init__(
+        self,
+        transaction: BrokerTransaction,
+        calculated_amount: Decimal,
+        supplied_amount: Decimal,
+    ):
         """Initialise."""
         super().__init__(
             transaction,
-            (
-                f"Calculated amount({calculated_amount}) differs "
-                f"from supplied amount ({transaction.amount})"
-            ),
+            f"The calculated amount {display_str(calculated_amount)} differs from "
+            f"the supplied amount {display_str(supplied_amount)}.",
         )
 
 
@@ -154,10 +337,64 @@ class CalculationError(CgtError):
 class ExchangeRateMissingError(CalculationError):
     """Exchange rate is missing error."""
 
-    def __init__(self, symbol: str, date: datetime.date):
+    def __init__(self, symbol: str, date: dt.date):
         """Initialise."""
         self.message = f"No GBP/{symbol} price for {date}"
         super().__init__(self.message)
+
+
+def rates_file_row(currency: str, date: dt.date, rates_file: Path | None) -> str:
+    """Say which file a rate goes in, what its row looks like and where to read more.
+
+    The row is written with <rate> in it, so that pasting it unchanged is
+    refused rather than read as a rate.
+    """
+    where = rates_file or "a file passed with --exchange-rates-file"
+    return (
+        f"{where}: a CSV file with the header 'month,currency,rate' and a row "
+        f"'{date},{currency},<rate>', the rate being units of {currency} per £1. "
+        "See https://cgt-calc.uk/extra-data-and-options/#exchange-rates"
+    )
+
+
+class HmrcRateMissingError(CalculationError):
+    """HMRC gives no rate cgt-calc can use for a currency on a date."""
+
+    def __init__(self, currency: str, date: dt.date, rates_file: Path | None):
+        """Initialise with the rates file the row should go in, if there is one."""
+        super().__init__(
+            f"cgt-calc has no HMRC exchange rate for {currency} on {date}. Add it to "
+            f"{rates_file_row(currency, date, rates_file)}"
+        )
+
+
+# What a prices file has to start with, said wherever one is asked for.
+_PRICES_FILE = "--prices-file (header 'date,symbol,price')"
+
+
+class SharePriceMissingError(CalculationError):
+    """No share price is given for a vest without one."""
+
+    def __init__(self, symbol: str, date: dt.date):
+        """Initialise."""
+        self.message = (
+            f"No share price for {symbol} on {date}: add it to a file passed with "
+            f"{_PRICES_FILE}"
+        )
+        super().__init__(self.message)
+
+
+class BundledPriceCurrencyError(CalculationError):
+    """A bundled USD price was asked for a transaction in another currency."""
+
+    def __init__(self, symbol: str, date: dt.date, currency: str):
+        """Initialise."""
+        super().__init__(
+            f"The bundled price for {symbol} on {date} is in USD, but the "
+            f"transaction is in {currency}. Enter the vest's price in the row, or "
+            "give it in the transaction's currency in a file passed with "
+            f"{_PRICES_FILE}."
+        )
 
 
 class LatexRenderError(CgtError):
@@ -176,6 +413,15 @@ class MissingExternalToolError(CgtError):
         super().__init__(f"Required tool '{tool}' is not available on PATH")
 
 
+class TransactionDumpError(CgtError):
+    """Raised when the parsed-transaction CSV cannot be written."""
+
+    def __init__(self, message: str):
+        """Initialise."""
+        self.message = message
+        super().__init__(self.message)
+
+
 class IsinTranslationError(CgtError):
     """Raised when invalid ISIN translation data is encountered."""
 
@@ -188,6 +434,45 @@ class IsinTranslationError(CgtError):
 class ExternalApiError(CgtError):
     """Raised when an external API request fails or returns invalid data."""
 
-    def __init__(self, url: str, message: str):
+    def __init__(self, url: str, message: str, advice: str = ""):
+        """Initialise; `advice`, what the user can do next, goes on its own line."""
+        text = f"{message} (source: {url})"
+        super().__init__(f"{text}\n{advice}" if advice else text)
+
+
+class InteractiveInputRequiredError(CgtError):
+    """Raised when a prompt is needed but stdin is not a terminal."""
+
+    def __init__(self, symbol: str, date: dt.date, spin_offs_file: Path | None):
         """Initialise."""
-        super().__init__(f"{message} (source: {url})")
+        if spin_offs_file is None:
+            # An empty --spin-offs-file disables the cache, so there is no file
+            # to add the row to: naming one would send the user in a circle.
+            hint = (
+                "Pass a non-empty --spin-offs-file path containing a "
+                f"'{symbol},<source>' row (header 'dst,src') and rerun."
+            )
+        else:
+            hint = (
+                f"Add a '{symbol},<source>' row to {spin_offs_file} "
+                "(header 'dst,src') and rerun."
+            )
+        super().__init__(
+            f"Cannot ask which stock {symbol} was spun off from on {date}: "
+            "standard input is not a terminal (this also applies when piping "
+            f"transactions via '-'). {hint}"
+        )
+
+
+class MarketDataMissingError(CgtError):
+    """Raised when the market data provider has no data for a symbol and date."""
+
+    def __init__(self, symbol: str, date: dt.date):
+        """Initialise."""
+        super().__init__(
+            f"No market data found for {symbol} around {date}. Yahoo Finance "
+            "may list it under a different ticker, or it may have been renamed "
+            "or delisted. Give the closing prices of both holdings in the "
+            "spin-off on that day, in the same currency, in a file passed with "
+            f"{_PRICES_FILE}, or work out the spin-off outside cgt-calc."
+        )

@@ -1,13 +1,11 @@
-"""Raw transaction parser."""
+"""ERI raw data CSV parser."""
 
 from __future__ import annotations
 
 import csv
-import datetime
-from decimal import Decimal, InvalidOperation
+import datetime as dt
 from importlib import resources
-import logging
-from typing import TYPE_CHECKING, Final, TextIO
+from typing import TYPE_CHECKING, Final, TextIO, override
 
 if TYPE_CHECKING:
     import argparse
@@ -17,11 +15,12 @@ if TYPE_CHECKING:
 
 from cgt_calc.const import ERI_RESOURCE_FOLDER
 from cgt_calc.exceptions import ParsingError, UnexpectedColumnCountError
+from cgt_calc.model import CurrencyCode, Isin, TransactionSource
 from cgt_calc.parsers.base_parsers import BaseSingleFileParser
 from cgt_calc.resources import RESOURCES_PACKAGE
-from cgt_calc.util import is_isin
+from cgt_calc.util import is_blank_row, parse_decimal
 
-from .model import EriTransaction
+from .model import ERITransaction
 
 COLUMNS: Final[list[str]] = [
     "ISIN",
@@ -29,10 +28,11 @@ COLUMNS: Final[list[str]] = [
     "Currency",
     "Excess of reporting income over distribution",
 ]
-LOGGER = logging.getLogger(__name__)
+
+RAW_DATE_FORMAT = "%d/%m/%Y"
 
 
-class EriRaw(EriTransaction):
+class ERIRaw(ERITransaction):
     """Represents a single raw ERI transaction."""
 
     def __init__(self, header: list[str], row_raw: list[str], file: Path) -> None:
@@ -42,19 +42,25 @@ class EriRaw(EriTransaction):
 
         row = dict(zip(header, row_raw, strict=True))
 
-        isin = row["ISIN"]
-        if not is_isin(isin):
-            raise ParsingError(file, f"Invalid ISIN value '{isin}' in ERI data")
+        isin_raw = row["ISIN"]
+        isin = Isin.parse(isin_raw)
+        if isin is None:
+            raise ParsingError(file, f"Invalid ISIN value '{isin_raw}' in ERI data")
         date_str = row["Fund Reporting Period End Date"]
         try:
-            date = datetime.datetime.strptime(date_str, "%d/%m/%Y").date()
+            date = dt.datetime.strptime(date_str, RAW_DATE_FORMAT).date()
         except ValueError as err:
             raise ParsingError(file, f"Invalid date '{date_str}' in ERI data") from err
-        currency = row["Currency"]
+        currency_raw = row["Currency"]
+        currency = CurrencyCode.parse(currency_raw)
+        if currency is None:
+            raise ParsingError(
+                file, f"Invalid currency value '{currency_raw}' in ERI data"
+            )
         price_str = row["Excess of reporting income over distribution"]
         try:
-            price = Decimal(price_str)
-        except (InvalidOperation, ValueError) as err:
+            price = parse_decimal(price_str, "ERI data")
+        except ValueError as err:
             raise ParsingError(
                 file, f"Invalid decimal '{price_str}' in ERI data"
             ) from err
@@ -67,22 +73,43 @@ class EriRaw(EriTransaction):
         )
 
 
-class ERIRawParser(BaseSingleFileParser):
-    """Parser for RAW format transaction files."""
+class ERIRawParser(BaseSingleFileParser[ERIRaw]):
+    """Parser for ERI (Excess Reported Income) CSV data files."""
 
     arg_name = "eri-raw"
     pretty_name = "Historical Excess Reported Income data"
     format_name = "CSV"
+    argument_help = "custom Excess Reported Income (ERI) data in CSV format"
 
     @staticmethod
-    def _validate_header(header: list[str], file: Path, columns: list[str]) -> None:
-        """Check if header is valid."""
-        for actual in header:
-            if actual not in columns:
-                msg = f"Unknown column {actual}"
-                raise ParsingError(file, msg)
+    def _validate_header(header: list[str], file: Path) -> None:
+        """Check that the header is the four columns, in any order."""
+        unknown_columns = sorted(set(header) - set(COLUMNS))
+        if unknown_columns:
+            raise ParsingError(
+                file,
+                f"Unknown columns: {', '.join(unknown_columns)}",
+                row_index=1,
+            )
+        # Each row is matched to the header cell by cell and then read by
+        # column name, so each of the four has to be there exactly once.
+        missing_columns = [column for column in COLUMNS if column not in header]
+        if missing_columns:
+            raise ParsingError(
+                file,
+                f"Missing columns: {', '.join(missing_columns)}",
+                row_index=1,
+            )
+        repeated_columns = [column for column in COLUMNS if header.count(column) > 1]
+        if repeated_columns:
+            raise ParsingError(
+                file,
+                f"Repeated columns: {', '.join(repeated_columns)}",
+                row_index=1,
+            )
 
     @classmethod
+    @override
     def load_from_args(cls, args: argparse.Namespace) -> list[BrokerTransaction]:
         """Load ERI data from arguments and pre-packaged data."""
         transactions: list[BrokerTransaction] = []
@@ -96,19 +123,29 @@ class ERIRawParser(BaseSingleFileParser):
         return transactions
 
     @classmethod
-    def read_transactions(
-        cls, file: TextIO, file_path: Path
-    ) -> list[BrokerTransaction]:
+    @override
+    def read_transactions(cls, file: TextIO, file_path: Path) -> list[ERIRaw]:
         """Read ERI raw transactions from file."""
 
         lines = list(csv.reader(file))
 
-        if not lines:
+        if all(is_blank_row(row) for row in lines):
             raise ParsingError(file_path, "ERI data file is empty")
 
         header = lines[0]
 
-        ERIRawParser._validate_header(header, file_path, COLUMNS)
+        cls._validate_header(header, file_path)
 
-        lines = lines[1:]
-        return [EriRaw(header, row, file_path) for row in lines]
+        transactions: list[ERIRaw] = []
+        for index, row in enumerate(lines[1:], start=2):
+            # Skip harmless blank rows left by editors or tooling.
+            if is_blank_row(row):
+                continue
+            try:
+                transaction = ERIRaw(header, row, file_path)
+            except ParsingError as err:
+                err.add_row_context(index)
+                raise
+            transaction.source = TransactionSource(row=index)
+            transactions.append(transaction)
+        return transactions

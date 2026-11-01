@@ -4,28 +4,138 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Iterator
-import datetime
+import datetime as dt
+from decimal import localcontext
+import logging
+import os
 from pathlib import Path
+import sys
+import threading
+from types import SimpleNamespace
 from typing import IO, TextIO, cast
 
 import pytest
 
-from cgt_calc.args_parser import create_parser
+from cgt_calc.args_parser import (
+    create_parser,
+    reject_duplicate_stdin,
+    resolve_reporting_period,
+)
 from cgt_calc.args_validators import (
+    STDIN_PATH,
     existing_directory_type,
+    existing_file_or_stdin_type,
     existing_file_type,
-    optional_file_type,
+    optional_cache_file_type,
 )
 from cgt_calc.const import (
     DEFAULT_EXCHANGE_RATES_FILE,
     DEFAULT_ISIN_TRANSLATION_FILE,
     DEFAULT_REPORT_PATH,
     DEFAULT_SPIN_OFF_FILE,
-    INTERNAL_START_DATE,
+    EARLIEST_TAX_YEAR,
 )
+from cgt_calc.main import main
 
 ReturnType = TextIO | IO[bytes]
 DirIterator = Iterator[Path]
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh", "fish", "tcsh", "powershell"])
+def test_print_completion_outputs_script(
+    shell: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Test that --print-completion prints a completion script and exits."""
+    parser = create_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["--print-completion", shell])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "--trading212-dir" in output
+    assert "--schwab-dir" in output
+    assert "--prices-file" in output
+
+
+def test_print_completion_zsh_completes_paths(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Test path completers and hidden deprecated flags in the zsh script."""
+    parser = create_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--print-completion", "zsh"])
+
+    output = capsys.readouterr().out
+    # Directory options complete directories, file options complete files.
+    assert ":DIR:_files -/" in output
+    assert ":PATH:_files" in output
+    # Deprecated aliases are hidden from help and must not be completed.
+    assert '"--report[' not in output
+    assert '"--trading212[' not in output
+
+
+def test_print_completion_zsh_covers_all_path_options(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Test that every PATH/DIR option in the zsh script completes paths."""
+    parser = create_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--print-completion", "zsh"])
+
+    output = capsys.readouterr().out
+    missing = [
+        line.strip()
+        for line in output.splitlines()
+        if (":PATH:" in line or ":DIR:" in line) and "_files" not in line
+    ]
+    assert not missing, f"options without a path completer: {missing}"
+
+
+def test_version_prints_version_and_exits(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Test that --version prints the version to stdout and exits."""
+    parser = create_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["--version"])
+
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.out.startswith("cgt-calc ")
+    assert captured.out.endswith("\n")
+
+
+def test_version_is_resolved_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that building the parser does not resolve the version."""
+
+    def explode() -> str:
+        raise AssertionError("version resolved without --version")
+
+    monkeypatch.setattr("cgt_calc.args_validators.get_version", explode)
+
+    parser = create_parser()
+    args = parser.parse_args([])
+
+    # --version is also kept out of the parsed arguments.
+    assert not hasattr(args, "version")
+
+
+def test_eri_raw_help_describes_data_not_transactions() -> None:
+    """Describe the ERI input as data rather than transaction history."""
+    help_text = " ".join(create_parser().format_help().split())
+
+    assert "custom Excess Reported Income (ERI) data in CSV format" in help_text
+
+
+def test_unrealized_gains_help_identifies_report_end_portfolio() -> None:
+    """Describe which holdings the current-price estimate uses."""
+    help_text = " ".join(create_parser().format_help().split())
+
+    assert "holdings in the report's ending portfolio" in help_text
 
 
 def test_output_and_no_report_mutually_exclusive() -> None:
@@ -40,52 +150,42 @@ def test_output_and_no_report_mutually_exclusive() -> None:
     assert exc_info.value.code == 2
 
 
-def test_output_relative_path() -> None:
-    """Test that --output accepts relative paths."""
-    parser = create_parser()
-    args = parser.parse_args(["--output", "reports/out.pdf"])
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--output", "reports/out.pdf"),
+        ("-o", "reports/out.pdf"),
+        ("--output", str(Path.cwd() / "report.pdf")),
+    ],
+    ids=["relative", "short option", "absolute"],
+)
+def test_output_accepts_a_path(option: str, value: str) -> None:
+    """--output and -o take a relative or absolute path."""
+    args = create_parser().parse_args([option, value])
 
-    assert args.output == Path("reports/out.pdf")
+    assert args.output == Path(value)
     assert args.no_report is False
 
 
-def test_output_short_relative_path() -> None:
-    """Test that -o accepts relative paths."""
-    parser = create_parser()
-    args = parser.parse_args(["-o", "reports/out.pdf"])
-
-    assert args.output == Path("reports/out.pdf")
-    assert args.no_report is False
-
-
-def test_output_absolute_path(tmp_path: Path) -> None:
-    """Test that --output accepts absolute paths."""
-    absolute_path = tmp_path / "report.pdf"
-    parser = create_parser()
-    args = parser.parse_args(["--output", str(absolute_path)])
-
-    assert args.output == absolute_path
-    assert args.no_report is False
-
-
-def test_output_rejects_empty_value() -> None:
-    """Test that --output rejects empty string values."""
-    parser = create_parser()
-
+@pytest.mark.parametrize("value", ["", "   "], ids=["empty", "whitespace"])
+def test_output_rejects_a_blank_value(value: str) -> None:
+    """--output refuses a value with nothing in it."""
     with pytest.raises(SystemExit) as exc_info:
-        parser.parse_args(["--output", ""])
+        create_parser().parse_args(["--output", value])
 
     assert exc_info.value.code == 2
 
 
-def test_output_rejects_whitespace_value() -> None:
-    """Test that --output rejects whitespace-only values."""
-    parser = create_parser()
-
+@pytest.mark.parametrize("option", ["--output", "--report", "--dump-transactions"])
+def test_output_options_refuse_a_dash(
+    option: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """'-' is refused: it would otherwise name a file, such as '-' or '-.pdf'."""
     with pytest.raises(SystemExit) as exc_info:
-        parser.parse_args(["--output", "   "])
+        create_parser().parse_args([option, "-"])
 
     assert exc_info.value.code == 2
+    assert "cannot be written to standard output" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -145,7 +245,9 @@ def test_broker_file_arguments_reject_missing_path(
 @pytest.mark.parametrize(
     ("option", "attr", "dirname"),
     [
+        ("--hl-dir", "hl_dir", "hl"),
         ("--mssb-dir", "mssb_dir", "mssb"),
+        ("--schwab-dir", "schwab_dir", "schwab"),
         ("--sharesight-dir", "sharesight_dir", "sharesight"),
         ("--trading212-dir", "trading212_dir", "trading212"),
     ],
@@ -167,12 +269,13 @@ def test_broker_dir_arguments_accept_existing_directory(
     ("option", "attr"),
     [
         ("--mssb-dir", "mssb_dir"),
+        ("--schwab-dir", "schwab_dir"),
         ("--sharesight-dir", "sharesight_dir"),
         ("--trading212-dir", "trading212_dir"),
     ],
 )
 def test_broker_dir_arguments_reject_invalid_paths(
-    tmp_path: Path, option: str, attr: str
+    tmp_path: Path, option: str, attr: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Ensure broker directory options reject missing directories or files."""
     parser = create_parser()
@@ -182,6 +285,7 @@ def test_broker_dir_arguments_reject_invalid_paths(
         parser.parse_args([option, str(missing_dir)])
 
     assert exc_info.value.code == 2
+    assert f"path does not exist: '{missing_dir}'" in capsys.readouterr().err
 
     file_path = tmp_path / "not_a_dir.csv"
     file_path.write_text("", encoding="utf-8")
@@ -190,6 +294,7 @@ def test_broker_dir_arguments_reject_invalid_paths(
         parser.parse_args([option, str(file_path)])
 
     assert exc_info.value.code == 2
+    assert f"expected directory path, got: '{file_path}'" in capsys.readouterr().err
 
     args = parser.parse_args([])
     assert getattr(args, attr) is None
@@ -232,8 +337,8 @@ def test_existing_directory_type_rejects_unreadable_dir(
         ("--spin-offs-file", "spin_offs_file", DEFAULT_SPIN_OFF_FILE),
     ],
 )
-def test_optional_path_arguments_default(option: str, attr: str, default: Path) -> None:
-    """Ensure optional path arguments use their default when not provided."""
+def test_cache_path_arguments_default(option: str, attr: str, default: Path) -> None:
+    """Ensure cache path arguments use their default when not provided."""
     parser = create_parser()
     args = parser.parse_args([])
 
@@ -248,10 +353,10 @@ def test_optional_path_arguments_default(option: str, attr: str, default: Path) 
         ("--spin-offs-file", "spin_offs_file", "custom_spin_offs.csv"),
     ],
 )
-def test_optional_path_arguments_accept_custom_path(
+def test_cache_path_arguments_accept_custom_path(
     option: str, attr: str, value: str
 ) -> None:
-    """Ensure optional path arguments convert provided values to Path."""
+    """Ensure cache path arguments convert provided values to Path."""
     parser = create_parser()
     args = parser.parse_args([option, value])
 
@@ -266,12 +371,33 @@ def test_optional_path_arguments_accept_custom_path(
         ("--spin-offs-file", "spin_offs_file"),
     ],
 )
-def test_optional_path_arguments_allow_empty_string(option: str, attr: str) -> None:
-    """Ensure optional path arguments treat empty values as None."""
+def test_cache_path_arguments_allow_empty_string(option: str, attr: str) -> None:
+    """Ensure cache path arguments treat empty values as None."""
     parser = create_parser()
     args = parser.parse_args([option, ""])
 
     assert getattr(args, attr) is None
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["--exchange-rates-file", "--isin-translation-file", "--spin-offs-file"],
+)
+def test_cache_path_arguments_reject_directory(
+    tmp_path: Path, option: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ensure cache path arguments reject directories when they exist."""
+    parser = create_parser()
+    directory = tmp_path / "existing_dir"
+    directory.mkdir()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args([option, str(directory)])
+
+    assert exc_info.value.code == 2
+    assert (
+        f"expected file path, got directory: '{directory}'" in capsys.readouterr().err
+    )
 
 
 @pytest.mark.parametrize(
@@ -282,26 +408,123 @@ def test_optional_path_arguments_allow_empty_string(option: str, attr: str) -> N
         ("--spin-offs-file", "spin_offs_file"),
     ],
 )
-def test_optional_path_arguments_reject_directory(
-    tmp_path: Path, option: str, attr: str
-) -> None:
-    """Ensure optional path arguments reject directories when they exist."""
+def test_cache_path_arguments_accept_leading_dash(option: str, attr: str) -> None:
+    """Only the bare stdin marker is rejected, not every leading-dash path."""
     parser = create_parser()
-    directory = tmp_path / "existing_dir"
-    directory.mkdir()
+
+    args = parser.parse_args([f"{option}=-rates.csv"])
+
+    assert getattr(args, attr) == Path("-rates.csv")
+
+
+VALIDATOR_DEADLINE_SECONDS = 10.0
+
+needs_fifo = pytest.mark.skipif(
+    not hasattr(os, "mkfifo"), reason="named pipes are POSIX only"
+)
+
+
+def _validate_without_blocking(
+    validator: Callable[[str], Path | None], value: str
+) -> Path | None:
+    """Run a validator off-thread so a blocking open fails instead of hanging."""
+    done: list[Path | None] = []
+    failed: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            done.append(validator(value))
+        except BaseException as err:  # noqa: BLE001
+            failed.append(err)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(VALIDATOR_DEADLINE_SECONDS)
+
+    assert not worker.is_alive(), f"validation blocked on '{value}'"
+    if failed:
+        raise failed[0]
+    return done[0]
+
+
+@needs_fifo
+def test_cache_path_arguments_reject_fifo(tmp_path: Path) -> None:
+    """A cache is read back with Path.is_file(), so a pipe can never be one."""
+    fifo = tmp_path / "cache.csv"
+    os.mkfifo(fifo)
+
+    with pytest.raises(argparse.ArgumentTypeError, match="expected regular file path"):
+        _validate_without_blocking(optional_cache_file_type, str(fifo))
+
+
+@needs_fifo
+@pytest.mark.parametrize(
+    "validator",
+    [existing_file_or_stdin_type, existing_file_type],
+    ids=["with_stdin", "without_stdin"],
+)
+def test_existing_file_types_accept_fifo_without_blocking(
+    validator: Callable[[str], Path], tmp_path: Path
+) -> None:
+    """Input files may be pipes, and probing one would block or steal data."""
+    fifo = tmp_path / "transactions.csv"
+    os.mkfifo(fifo)
+
+    assert _validate_without_blocking(validator, str(fifo)) == fifo
+
+
+@pytest.mark.parametrize(
+    "validator",
+    [optional_cache_file_type, existing_file_or_stdin_type, existing_file_type],
+    ids=["cache", "with_stdin", "without_stdin"],
+)
+def test_path_validators_reject_unresolvable_home(
+    validator: Callable[[str], Path | None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unresolvable '~user' must be a parse error, not a RuntimeError."""
+
+    def refuse_expansion(self: Path) -> Path:
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(Path, "expanduser", refuse_expansion)
+
+    with pytest.raises(argparse.ArgumentTypeError, match="unable to expand user path"):
+        validator("~nonexistent-user/data.csv")
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="'~user' always expands to a sibling path on Windows"
+)
+def test_cache_path_arguments_reject_unknown_user(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The real unknown-user case exits instead of printing a traceback."""
+    parser = create_parser()
 
     with pytest.raises(SystemExit) as exc_info:
-        parser.parse_args([option, str(directory)])
+        parser.parse_args(["--exchange-rates-file", "~nonexistent-user/rates.csv"])
 
     assert exc_info.value.code == 2
-    args = parser.parse_args([])
-    assert getattr(args, attr) is not None
+    assert "unable to expand user path" in capsys.readouterr().err
 
 
-def test_optional_file_type_rejects_unreadable_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_cache_path_arguments_expand_user() -> None:
+    """A quoted '~' must expand, not become a directory literally named '~'."""
+    path = optional_cache_file_type("~/rates.csv")
+
+    assert path == Path.home() / "rates.csv"
+    assert "~" not in path.parts
+
+
+@pytest.mark.parametrize(
+    "validator", [optional_cache_file_type, existing_file_or_stdin_type]
+)
+def test_file_types_reject_an_unreadable_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    validator: Callable[[str], Path | None],
 ) -> None:
-    """optional_file_type raises when file cannot be read."""
+    """A file that exists but cannot be opened is refused at parse time."""
     target = tmp_path / "data.csv"
     target.write_text("value,1\n", encoding="utf8")
     original_open = cast(
@@ -324,36 +547,7 @@ def test_optional_file_type_rejects_unreadable_file(
     monkeypatch.setattr(Path, "open", fake_open)
 
     with pytest.raises(argparse.ArgumentTypeError, match="unable to read file path"):
-        optional_file_type(str(target))
-
-
-def test_existing_file_type_rejects_unreadable_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """existing_file_type raises when file cannot be read."""
-    target = tmp_path / "data.csv"
-    target.write_text("value,1\n", encoding="utf8")
-    original_open = cast(
-        "Callable[[Path, str, int, str | None, str | None, str | None], ReturnType]",
-        Path.open,
-    )
-
-    def fake_open(
-        self: Path,
-        mode: str = "r",
-        buffering: int = -1,
-        encoding: str | None = None,
-        errors: str | None = None,
-        newline: str | None = None,
-    ) -> ReturnType:
-        if self == target:
-            raise PermissionError("Permission denied")
-        return original_open(self, mode, buffering, encoding, errors, newline)
-
-    monkeypatch.setattr(Path, "open", fake_open)
-
-    with pytest.raises(argparse.ArgumentTypeError, match="unable to read file path"):
-        existing_file_type(str(target))
+        validator(str(target))
 
 
 def test_no_report_alone_works() -> None:
@@ -366,16 +560,6 @@ def test_no_report_alone_works() -> None:
     assert args.output == DEFAULT_REPORT_PATH
 
 
-def test_short_option_output_and_no_report_mutually_exclusive() -> None:
-    """Test that -o and --no-report are mutually exclusive."""
-    parser = create_parser()
-
-    with pytest.raises(SystemExit) as exc_info:
-        parser.parse_args(["-o", "test.pdf", "--no-report"])
-
-    assert exc_info.value.code == 2
-
-
 def test_default_output_when_neither_specified() -> None:
     """Test default output path when neither option is specified."""
     parser = create_parser()
@@ -386,9 +570,9 @@ def test_default_output_when_neither_specified() -> None:
 
 
 def test_year_validation_too_early() -> None:
-    """Test that year before INTERNAL_START_DATE is rejected."""
+    """Test that year before EARLIEST_TAX_YEAR is rejected."""
     parser = create_parser()
-    min_year = INTERNAL_START_DATE.year
+    min_year = EARLIEST_TAX_YEAR
     invalid_year = min_year - 1
 
     with pytest.raises(SystemExit) as exc_info:
@@ -400,7 +584,7 @@ def test_year_validation_too_early() -> None:
 def test_year_validation_too_late() -> None:
     """Test that year in the future is rejected."""
     parser = create_parser()
-    current_year = datetime.datetime.now().year
+    current_year = dt.datetime.now().year
     invalid_year = current_year + 1
 
     with pytest.raises(SystemExit) as exc_info:
@@ -412,7 +596,7 @@ def test_year_validation_too_late() -> None:
 def test_year_validation_min_valid() -> None:
     """Test that minimum valid year is accepted."""
     parser = create_parser()
-    min_year = INTERNAL_START_DATE.year
+    min_year = EARLIEST_TAX_YEAR
 
     args = parser.parse_args(["--year", str(min_year)])
 
@@ -422,74 +606,515 @@ def test_year_validation_min_valid() -> None:
 def test_year_validation_max_valid() -> None:
     """Test that maximum valid year (current year) is accepted."""
     parser = create_parser()
-    current_year = datetime.datetime.now().year
+    current_year = dt.datetime.now().year
 
     args = parser.parse_args(["--year", str(current_year)])
 
     assert args.year == current_year
 
 
-def test_year_validation_valid_middle() -> None:
-    """Test that a year in the middle of valid range is accepted."""
+@pytest.mark.parametrize("option", ["--interest-fund-tickers", "--cgt-exempt-tickers"])
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("VGOV", ["VGOV"]),
+        ("VGOV,VBMFX,VWEHX", ["VGOV", "VBMFX", "VWEHX"]),
+        (" VGOV , VBMFX , VWEHX ", ["VGOV", "VBMFX", "VWEHX"]),
+        ("vgov,vbmfx", ["VGOV", "VBMFX"]),
+        ("VGOV,,VBMFX,", ["VGOV", "VBMFX"]),
+    ],
+    ids=["single", "several", "spaces trimmed", "upper-cased", "empty items dropped"],
+)
+def test_ticker_list_options(option: str, value: str, expected: list[str]) -> None:
+    """Both ticker-list options split on commas, trim, upper-case, drop empties."""
+    args = create_parser().parse_args([option, value])
+
+    assert getattr(args, option.removeprefix("--").replace("-", "_")) == expected
+
+
+@pytest.mark.parametrize("attr", ["interest_fund_tickers", "cgt_exempt_tickers"])
+def test_ticker_list_options_default_to_empty(attr: str) -> None:
+    """Without the option, the list is empty."""
+    assert getattr(create_parser().parse_args([]), attr) == []
+
+
+def test_existing_file_or_stdin_type_accepts_stdin() -> None:
+    """Ensure existing_file_or_stdin_type returns STDIN_PATH when passed '-'."""
+    assert existing_file_or_stdin_type("-") == STDIN_PATH
+
+
+def test_every_broker_path_option_accepts_stdin() -> None:
+    """The help says any broker PATH can be '-', so each one has to accept it."""
     parser = create_parser()
-    min_year = INTERNAL_START_DATE.year
-    current_year = datetime.datetime.now().year
-    middle_year = (min_year + current_year) // 2
+    group = next(
+        group
+        for group in parser._action_groups  # noqa: SLF001
+        if group.title == "Broker inputs"
+    )
 
-    args = parser.parse_args(["--year", str(middle_year)])
+    refusing = [
+        action.option_strings[0]
+        for action in group._group_actions  # noqa: SLF001
+        if action.metavar == "PATH" and action.type is not existing_file_or_stdin_type
+    ]
+    assert not refusing
 
-    assert args.year == middle_year
 
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--exchange-rates-file",
+        "--isin-translation-file",
+        "--spin-offs-file",
+        "--prices-file",
+        "--initial-prices-file",
+        "--initial-prices",
+    ],
+)
+def test_options_without_a_stdin_consumer_reject_stdin(
+    option: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Options that never read stdin reject '-' at parse time.
 
-def test_interest_fund_tickers_single() -> None:
-    """Test that a single ticker is parsed correctly."""
+    A cache path would otherwise write a file named '-'.
+    """
     parser = create_parser()
 
-    args = parser.parse_args(["--interest-fund-tickers", "VGOV"])
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args([option, "-"])
 
-    assert args.interest_fund_tickers == ["VGOV"]
+    assert exc_info.value.code == 2
+    assert "got stdin marker" in capsys.readouterr().err
 
 
-def test_interest_fund_tickers_multiple() -> None:
-    """Test that multiple tickers are parsed correctly."""
+def test_existing_file_type_rejects_stdin() -> None:
+    """Ensure existing_file_type refuses the stdin marker."""
+    with pytest.raises(argparse.ArgumentTypeError, match="got stdin marker"):
+        existing_file_type("-")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--raw-file", "-", "--schwab-file", "-"],
+        ["--raw-file", "-", "--eri-raw-file", "-"],
+        ["--vanguard-file", "-", "--freetrade-file", "-", "--raw-file", "-"],
+    ],
+)
+def test_reject_duplicate_stdin_rejects_several_options(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ensure '-' given to more than one option fails with a helpful error."""
+    parser = create_parser()
+    args = parser.parse_args(argv)
+
+    with pytest.raises(SystemExit) as exc_info:
+        reject_duplicate_stdin(parser, args)
+
+    assert exc_info.value.code == 2
+    message = capsys.readouterr().err
+    assert "can only be given to one option" in message
+    for option in argv[::2]:
+        assert option in message
+
+
+def test_reject_duplicate_stdin_allows_a_single_option() -> None:
+    """Ensure a single '-' is still accepted."""
+    parser = create_parser()
+    args = parser.parse_args(["--raw-file", "-"])
+
+    reject_duplicate_stdin(parser, args)
+
+    assert args.raw_file == STDIN_PATH
+
+
+def test_schwab_award_file_help_names_both_kinds_of_export() -> None:
+    """The canonical option's help says it takes either kind of export."""
+    help_text = " ".join(create_parser().format_help().split())
+
+    assert (
+        "--schwab-award-file PATH Charles Schwab Equity Awards export as CSV or "
+        "JSON: the award account's complete history, or the export that only "
+        "prices vests in the main history" in help_text
+    )
+
+
+@pytest.mark.parametrize("option", ["--schwab-award-file", "--schwab-award"])
+def test_schwab_award_file_accepts_stdin(option: str) -> None:
+    """The canonical award option reads a piped export, as its alias does."""
     parser = create_parser()
 
-    args = parser.parse_args(["--interest-fund-tickers", "VGOV,VBMFX,VWEHX"])
+    args = parser.parse_args([option, "-"])
 
-    assert args.interest_fund_tickers == ["VGOV", "VBMFX", "VWEHX"]
+    assert args.schwab_award_file == STDIN_PATH
 
 
-def test_interest_fund_tickers_with_spaces() -> None:
-    """Test that tickers with spaces are trimmed correctly."""
+def test_reject_duplicate_stdin_covers_the_award_file() -> None:
+    """Changing the option type is all the existing stdin check needs."""
+    parser = create_parser()
+    args = parser.parse_args(["--schwab-award-file", "-", "--raw-file", "-"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        reject_duplicate_stdin(parser, args)
+
+    assert exc_info.value.code == 2
+
+
+def test_reject_duplicate_stdin_ignores_ordinary_paths(tmp_path: Path) -> None:
+    """Ensure real paths never count towards the stdin limit."""
+    first = tmp_path / "raw.csv"
+    first.write_text("", encoding="utf-8")
+    second = tmp_path / "schwab.csv"
+    second.write_text("", encoding="utf-8")
+    parser = create_parser()
+    args = parser.parse_args(["--raw-file", str(first), "--schwab-file", str(second)])
+
+    reject_duplicate_stdin(parser, args)
+
+    assert args.raw_file == first
+
+
+def test_main_rejects_stdin_given_to_several_options(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The duplicate stdin check runs before any work is done."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cgt-calc", "--year", "2021", "--raw-file", "-", "--schwab-file", "-"],
+    )
+
+    # main() enables the FloatOperation trap on the active decimal context;
+    # keep that from leaking into other tests in the same worker.
+    with localcontext(), pytest.raises(SystemExit) as exc_info:
+        main()
+
+    assert exc_info.value.code == 2
+    assert "can only be given to one option" in capsys.readouterr().err
+
+
+def _options_taking_a_value() -> list[tuple[str, object]]:
+    """Every option that takes a value, with the type that reads the value."""
+    return [
+        (option, action.type)
+        for action in create_parser()._actions  # noqa: SLF001
+        # --print-completion prints a script and exits where it stands.
+        if action.nargs != 0 and action.dest != "print_completion"
+        for option in action.option_strings
+    ]
+
+
+@pytest.mark.parametrize(
+    ("option", "value_type"),
+    _options_taking_a_value(),
+    ids=[option for option, _ in _options_taking_a_value()],
+)
+def test_an_option_given_twice_is_refused(
+    option: str,
+    value_type: object,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A second value would replace the first with no word of it.
+
+    The two values differ wherever the option allows, so keeping either one
+    would be a choice the user did not make.
+    """
+    first_file, second_file = tmp_path / "first.csv", tmp_path / "second.csv"
+    first_dir, second_dir = tmp_path / "first", tmp_path / "second"
+    for file in (first_file, second_file):
+        file.write_text("", encoding="utf-8")
+    for directory in (first_dir, second_dir):
+        directory.mkdir()
+    files = (str(first_file), str(second_file))
+    # Keyed by the function that reads the value, so an option with a new kind
+    # of value has to say here what two of them look like.
+    values = {
+        "year_type": ("2021", "2022"),
+        "date_type": ("2021-04-06", "2022-04-05"),
+        "income_type": ("45000", "50000"),
+        "existing_file_or_stdin_type": files,
+        "existing_file_type": files,
+        "optional_cache_file_type": files,
+        "existing_directory_type": (str(first_dir), str(second_dir)),
+        "ticker_list_type": ("AAA", "BBB"),
+        "output_path_type": (str(tmp_path / "a.pdf"), str(tmp_path / "b.pdf")),
+    }[getattr(value_type, "__name__", "")]
+
+    with pytest.raises(SystemExit) as exc_info:
+        create_parser().parse_args([option, values[0], option, values[1]])
+
+    assert exc_info.value.code == 2
+    assert (
+        f"error: {option} gives a second value for an option that takes one. "
+        "cgt-calc would have used only the last and ignored the other: give the "
+        "option once."
+    ) in " ".join(capsys.readouterr().err.split())
+
+
+@pytest.mark.parametrize(
+    ("option", "default", "other"),
+    [
+        ("--output", str(DEFAULT_REPORT_PATH), "mine.pdf"),
+        ("--exchange-rates-file", str(DEFAULT_EXCHANGE_RATES_FILE), "mine.csv"),
+        # No tickers, which is what the option holds when it is not given.
+        ("--interest-fund-tickers", "", "AAA"),
+    ],
+)
+def test_a_first_value_that_equals_the_default_still_counts(
+    option: str, default: str, other: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Typing the default out is giving the option, so a second value is refused."""
+    with pytest.raises(SystemExit) as exc_info:
+        create_parser().parse_args([option, default, option, other])
+
+    assert exc_info.value.code == 2
+    assert (
+        f"error: {option} gives a second value for an option that takes one."
+        in " ".join(capsys.readouterr().err.split())
+    )
+
+
+def test_the_same_value_given_twice_is_refused(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A repeat is refused whether or not it agrees with the first value."""
+    with pytest.raises(SystemExit) as exc_info:
+        create_parser().parse_args(["--year", "2021", "--year", "2021"])
+
+    assert exc_info.value.code == 2
+    assert (
+        "error: --year gives a second value for an option that takes one."
+        in " ".join(capsys.readouterr().err.split())
+    )
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [("--raw", "--raw-file"), ("--raw-file", "--raw")],
+)
+def test_an_option_and_its_old_name_are_one_option(
+    first: str, second: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Given under both names, one of the two files would not be read."""
+    files = [tmp_path / "transfers.csv", tmp_path / "splits.csv"]
+    for file in files:
+        file.write_text("", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc_info:
+        create_parser().parse_args([first, str(files[0]), second, str(files[1])])
+
+    assert exc_info.value.code == 2
+    assert (
+        f"error: {second} gives a second value for an option that takes one."
+        in " ".join(capsys.readouterr().err.split())
+    )
+
+
+@pytest.mark.parametrize("option", ["--initial-prices-file", "--initial-prices"])
+def test_old_prices_file_names_still_work_but_warn(
+    option: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Both earlier names of --prices-file still set it, and name the new one."""
+    file_path = tmp_path / "prices.csv"
+    file_path.write_text("", encoding="utf-8")
     parser = create_parser()
 
-    args = parser.parse_args(["--interest-fund-tickers", " VGOV , VBMFX , VWEHX "])
+    with caplog.at_level(logging.WARNING):
+        args = parser.parse_args([option, str(file_path)])
 
-    assert args.interest_fund_tickers == ["VGOV", "VBMFX", "VWEHX"]
+    assert args.prices_file == file_path
+    assert (
+        f"Option '{option}' is deprecated; use '--prices-file' instead." in caplog.text
+    )
 
 
-def test_interest_fund_tickers_lowercase() -> None:
-    """Test that lowercase tickers are converted to uppercase."""
+@pytest.mark.parametrize(
+    ("period_from", "period_to", "tax_year"),
+    [
+        pytest.param(
+            dt.date(2024, 4, 6),
+            dt.date(2024, 10, 29),
+            2024,
+            id="from the first day of 2024/25",
+        ),
+        pytest.param(
+            dt.date(2024, 1, 10),
+            dt.date(2024, 4, 5),
+            2023,
+            id="to the last day of 2023/24",
+        ),
+    ],
+)
+def test_resolve_period_from_to(
+    period_from: dt.date, period_to: dt.date, tax_year: int
+) -> None:
+    """--from/--to resolve to the tax year the range falls in, which starts on 6 April."""
     parser = create_parser()
+    args = parser.parse_args(["--from", str(period_from), "--to", str(period_to)])
 
-    args = parser.parse_args(["--interest-fund-tickers", "vgov,vbmfx"])
+    resolve_reporting_period(parser, args)
 
-    assert args.interest_fund_tickers == ["VGOV", "VBMFX"]
+    assert args.year == tax_year
+    assert args.period_from == period_from
+    assert args.period_to == period_to
 
 
-def test_interest_fund_tickers_empty_default() -> None:
-    """Test that default is an empty list when not specified."""
+@pytest.mark.parametrize(
+    ("today", "tax_year"),
+    [
+        pytest.param(dt.date(2025, 4, 5), 2023, id="2024/25 has a day to run"),
+        pytest.param(dt.date(2025, 4, 6), 2024, id="2024/25 ended yesterday"),
+    ],
+)
+def test_resolve_period_defaults_year_when_absent(
+    monkeypatch: pytest.MonkeyPatch, today: dt.date, tax_year: int
+) -> None:
+    """--year defaults to the last tax year to have ended, and one ends on 5 April."""
+    stopped = dt.datetime.combine(today, dt.time())
+    monkeypatch.setattr(
+        "cgt_calc.args_parser.dt",
+        SimpleNamespace(datetime=SimpleNamespace(now=lambda: stopped), date=dt.date),
+    )
     parser = create_parser()
-
     args = parser.parse_args([])
 
-    assert args.interest_fund_tickers == []
+    resolve_reporting_period(parser, args)
+
+    assert args.year == tax_year
 
 
-def test_interest_fund_tickers_empty_items_filtered() -> None:
-    """Test that empty items (e.g., trailing commas) are filtered out."""
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # --from and --to must be used together.
+        ["--from", "2024-04-06"],
+        ["--to", "2024-10-29"],
+        # --year cannot be combined with a custom period.
+        ["--year", "2024", "--from", "2024-04-06", "--to", "2024-10-29"],
+        # --from must not be after --to.
+        ["--from", "2024-10-29", "--to", "2024-04-06"],
+        # The period must stay within one UK tax year.
+        ["--from", "2024-04-05", "--to", "2024-04-06"],
+        ["--from", "2024-10-29", "--to", "2025-04-06"],
+    ],
+)
+def test_resolve_period_rejects_invalid_combinations(argv: list[str]) -> None:
+    """Test that invalid --year/--from/--to combinations exit with an error."""
+    parser = create_parser()
+    args = parser.parse_args(argv)
+
+    with pytest.raises(SystemExit) as exc_info:
+        resolve_reporting_period(parser, args)
+
+    assert exc_info.value.code == 2
+
+
+def test_income_is_refused_with_a_custom_period(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The tax is worked out for a whole tax year, so --income needs one."""
+    parser = create_parser()
+    args = parser.parse_args(
+        ["--income", "45000", "--from", "2024-04-06", "--to", "2024-10-29"]
+    )
+
+    with pytest.raises(SystemExit):
+        resolve_reporting_period(parser, args)
+
+    assert (
+        "--income cannot be combined with --from/--to: the tax is estimated for a "
+        "full tax year" in capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize("value", ["45,000", "45.000", "45000.50", "1234567890123"])
+def test_an_income_that_is_not_whole_pounds_is_refused(
+    value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Only whole pounds, written as up to twelve digits, are read as an income.
+
+    A comma or a dot could separate thousands or pence, and guessing wrong
+    turns 45.000 into £45 or 45000,50 into four and a half million. Twelve
+    digits are more than any income needs.
+    """
+    with pytest.raises(SystemExit):
+        create_parser().parse_args([f"--income={value}"])
+
+    assert (
+        f"invalid income: '{value}', expected whole pounds such as 45000"
+        in capsys.readouterr().err
+    )
+
+
+def test_resolve_period_rejects_a_period_before_the_earliest_tax_year(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A period before 2008/09 is refused, like --year before it."""
+    parser = create_parser()
+    args = parser.parse_args(["--from", "2007-04-06", "--to", "2008-04-05"])
+
+    with pytest.raises(SystemExit):
+        resolve_reporting_period(parser, args)
+
+    assert (
+        "--from must not be before 2008-04-06, the start of the earliest tax year "
+        "cgt-calc supports"
+    ) in capsys.readouterr().err
+
+
+def test_from_rejects_invalid_date() -> None:
+    """Test that malformed dates are rejected at parse time."""
     parser = create_parser()
 
-    args = parser.parse_args(["--interest-fund-tickers", "VGOV,,VBMFX,"])
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["--from", "2024-13-01", "--to", "2024-12-31"])
 
-    assert args.interest_fund_tickers == ["VGOV", "VBMFX"]
+    assert exc_info.value.code == 2
+
+
+def test_autoconvert_currency_is_opt_in() -> None:
+    """Currency mismatches remain errors unless the user enables conversion."""
+    parser = create_parser()
+
+    assert parser.parse_args([]).autoconvert_currency is False
+    assert parser.parse_args(["--autoconvert-currency"]).autoconvert_currency is True
+
+
+def test_dump_transactions_defaults_to_no_export() -> None:
+    """--dump-transactions is off unless a destination is given."""
+    parser = create_parser()
+
+    assert parser.parse_args([]).dump_transactions is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "parsed.csv",
+        "reports/parsed.csv",
+        # The option once took mode words; they are now ordinary filenames.
+        "only",
+        "continue",
+        # A file really named '-' can still be asked for by an explicit path.
+        "./-",
+    ],
+)
+def test_dump_transactions_takes_a_path(value: str) -> None:
+    """--dump-transactions accepts an ordinary path."""
+    parser = create_parser()
+
+    args = parser.parse_args(["--dump-transactions", value])
+
+    assert args.dump_transactions == Path(value)
+
+
+@pytest.mark.parametrize("argv", [["--dump-transactions"], ["--dump-transactions", ""]])
+def test_dump_transactions_requires_a_destination(argv: list[str]) -> None:
+    """--dump-transactions is rejected without a usable path."""
+    parser = create_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(argv)
+
+    assert exc_info.value.code == 2

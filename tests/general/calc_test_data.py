@@ -1,27 +1,37 @@
-"""Additional tests for calc."""
+"""Test data for calc tests."""
 
 from __future__ import annotations
 
-import datetime
+import datetime as dt
 from decimal import Decimal
 
 import pytest
 
-from cgt_calc.model import ActionType, BrokerTransaction, CalculationEntry, RuleType
+from cgt_calc.model import (
+    ActionType,
+    BrokerTransaction,
+    CalculationEntry,
+    CurrencyCode,
+    Isin,
+    RuleType,
+)
 from cgt_calc.util import round_decimal
+
+USD = CurrencyCode("USD")
+GBP = CurrencyCode("GBP")
 
 
 def interest_transaction(
-    date: datetime.date,
+    date: dt.date,
     amount: float,
-    currency: str = "USD",
+    currency: CurrencyCode = USD,
 ) -> BrokerTransaction:
     """Create interest transaction."""
     return transaction(date, ActionType.INTEREST, None, None, None, 0, amount, currency)
 
 
 def dividend_transaction(
-    date: datetime.date,
+    date: dt.date,
     symbol: str,
     amount: float,
 ) -> BrokerTransaction:
@@ -38,7 +48,7 @@ def dividend_transaction(
 
 
 def dividend_tax_transaction(
-    date: datetime.date,
+    date: dt.date,
     symbol: str,
     amount: float,
 ) -> BrokerTransaction:
@@ -55,8 +65,8 @@ def dividend_tax_transaction(
 
 
 def eri_transaction(
-    date: datetime.date,
-    isin: str,
+    date: dt.date,
+    isin: Isin,
     price: float,
 ) -> BrokerTransaction:
     """Create excess reported income transaction."""
@@ -64,13 +74,13 @@ def eri_transaction(
 
 
 def buy_transaction(
-    date: datetime.date,
+    date: dt.date,
     symbol: str,
     quantity: float,
     price: float,
     fees: float,
     amount: float,
-    isin: str | None = None,
+    isin: Isin | None = None,
 ) -> BrokerTransaction:
     """Create buy transaction."""
     return transaction(
@@ -86,13 +96,13 @@ def buy_transaction(
 
 
 def sell_transaction(
-    date: datetime.date,
+    date: dt.date,
     symbol: str,
     quantity: float,
     price: float,
     fees: float,
     amount: float,
-    isin: str | None = None,
+    isin: Isin | None = None,
 ) -> BrokerTransaction:
     """Create sell transaction."""
     return transaction(
@@ -108,7 +118,7 @@ def sell_transaction(
 
 
 def transfer_transaction(
-    date: datetime.date,
+    date: dt.date,
     amount: float,
     fees: float = 0,
 ) -> BrokerTransaction:
@@ -121,16 +131,33 @@ def transfer_transaction(
     )
 
 
+def transfer_to_spouse_transaction(
+    date: dt.date,
+    symbol: str,
+    quantity: float,
+    currency: CurrencyCode = GBP,
+) -> BrokerTransaction:
+    """Create a no gain/no loss transfer to spouse transaction."""
+    return transaction(
+        date,
+        ActionType.TRANSFER_TO_SPOUSE,
+        symbol,
+        quantity,
+        currency=currency,
+    )
+
+
 def transaction(
-    date: datetime.date,
+    date: dt.date,
     action_type: ActionType,
     symbol: str | None = None,
     quantity: float | None = None,
     price: float | None = None,
     fees: float = 0.0,
     amount: float | None = None,
-    currency: str = "USD",
-    isin: str | None = None,
+    currency: CurrencyCode = USD,
+    isin: Isin | None = None,
+    broker: str = "Testing",
 ) -> BrokerTransaction:
     """Create transaction."""
     return BrokerTransaction(
@@ -143,17 +170,17 @@ def transaction(
         fees=round_decimal(Decimal(fees), 6),
         amount=round_decimal(Decimal(amount), 6) if amount else None,
         currency=currency,
-        broker="Testing",
+        broker=broker,
         isin=isin,
     )
 
 
 def split_transaction(
-    date: datetime.date,
+    date: dt.date,
     symbol: str,
     quantity: float,
 ) -> BrokerTransaction:
-    """Create sell transaction."""
+    """Create stock split transaction."""
     return BrokerTransaction(
         date,
         ActionType.STOCK_SPLIT,
@@ -163,18 +190,74 @@ def split_transaction(
         price=Decimal(0),
         fees=Decimal(0),
         amount=Decimal(0),
-        currency="USD",
+        currency=CurrencyCode("USD"),
         broker="Testing",
     )
 
+
+# HMRC's Example 3 spans a tax year end: the disposal of 31 March is matched
+# against acquisitions made in April, which fall in the next year. The same
+# transactions are therefore checked twice, once per year.
+CRYPTO22253_TRANSACTIONS = [
+    transfer_transaction(dt.date(day=1, month=1, year=2021), 2000),
+    # Opening pool: 2,000 tokens for £1,000.
+    buy_transaction(
+        date=dt.date(day=1, month=1, year=2021),
+        symbol="TOK",
+        quantity=2000,
+        price=0.5,
+        fees=0,
+        amount=-1000,
+    ),
+    sell_transaction(
+        date=dt.date(day=31, month=3, year=2021),
+        symbol="TOK",
+        quantity=1000,
+        price=0.4,
+        fees=0,
+        amount=400,
+    ),
+    sell_transaction(
+        date=dt.date(day=20, month=4, year=2021),
+        symbol="TOK",
+        quantity=500,
+        price=0.3,
+        fees=0,
+        amount=150,
+    ),
+    buy_transaction(
+        date=dt.date(day=21, month=4, year=2021),
+        symbol="TOK",
+        quantity=700,
+        price=0.25,
+        fees=0,
+        amount=-175,
+    ),
+    buy_transaction(
+        date=dt.date(day=28, month=4, year=2021),
+        symbol="TOK",
+        quantity=500,
+        price=0.2,
+        fees=0,
+        amount=-100,
+    ),
+    buy_transaction(
+        date=dt.date(day=1, month=5, year=2021),
+        symbol="TOK",
+        quantity=500,
+        price=0.3,
+        fees=0,
+        amount=-150,
+    ),
+]
 
 calc_basic_data = [
     pytest.param(
         2020,  # tax year
         [
-            transfer_transaction(datetime.date(day=1, month=5, year=2020), 5000),
+            transfer_transaction(dt.date(day=1, month=5, year=2020), 5000),
             buy_transaction(
-                date=datetime.date(day=1, month=5, year=2020),
+                date=dt.date(day=1, month=5, year=2020),
                 symbol="FOO",
                 quantity=3,
                 price=5,
@@ -182,7 +265,7 @@ calc_basic_data = [
                 amount=-16,
             ),
             sell_transaction(
-                date=datetime.date(day=1, month=5, year=2020),
+                date=dt.date(day=1, month=5, year=2020),
                 symbol="FOO",
                 quantity=3,
                 price=6,
@@ -199,7 +282,7 @@ calc_basic_data = [
         0.00,  # Expected dividend
         0.00,  # Expected dividend gain
         {
-            datetime.date(day=1, month=5, year=2020): {
+            dt.date(day=1, month=5, year=2020): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -231,9 +314,9 @@ calc_basic_data = [
     pytest.param(
         2020,  # tax year
         [
-            transfer_transaction(datetime.date(day=1, month=4, year=2014), 6280),
+            transfer_transaction(dt.date(day=1, month=4, year=2014), 6280),
             buy_transaction(
-                date=datetime.date(day=1, month=4, year=2014),
+                date=dt.date(day=1, month=4, year=2014),
                 symbol="LOB",
                 quantity=1000,
                 price=4,
@@ -241,7 +324,7 @@ calc_basic_data = [
                 amount=-4150,
             ),
             buy_transaction(
-                date=datetime.date(day=1, month=9, year=2017),
+                date=dt.date(day=1, month=9, year=2017),
                 symbol="LOB",
                 quantity=500,
                 price=4.1,
@@ -249,7 +332,7 @@ calc_basic_data = [
                 amount=-2130,
             ),
             sell_transaction(
-                date=datetime.date(day=1, month=5, year=2020),
+                date=dt.date(day=1, month=5, year=2020),
                 symbol="LOB",
                 quantity=700,
                 price=4.8,
@@ -257,7 +340,7 @@ calc_basic_data = [
                 amount=3260,
             ),
             sell_transaction(
-                date=datetime.date(day=1, month=2, year=2021),
+                date=dt.date(day=1, month=2, year=2021),
                 symbol="LOB",
                 quantity=400,
                 price=5.2,
@@ -275,7 +358,7 @@ calc_basic_data = [
         0.00,  # Expected dividend
         0.00,  # Expected dividend gain
         {
-            datetime.date(day=1, month=5, year=2020): {
+            dt.date(day=1, month=5, year=2020): {
                 "sell$LOB": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -289,7 +372,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=1, month=2, year=2021): {
+            dt.date(day=1, month=2, year=2021): {
                 "sell$LOB": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -311,9 +394,9 @@ calc_basic_data = [
     pytest.param(
         2020,  # tax year
         [
-            transfer_transaction(datetime.date(day=1, month=1, year=2019), 15100),
+            transfer_transaction(dt.date(day=1, month=1, year=2019), 15100),
             buy_transaction(
-                date=datetime.date(day=1, month=1, year=2019),
+                date=dt.date(day=1, month=1, year=2019),
                 symbol="MSP",
                 quantity=9500,
                 price=1.5,
@@ -321,7 +404,7 @@ calc_basic_data = [
                 amount=-14250,
             ),
             sell_transaction(
-                date=datetime.date(day=30, month=8, year=2020),
+                date=dt.date(day=30, month=8, year=2020),
                 symbol="MSP",
                 quantity=4000,
                 price=1.5,
@@ -329,7 +412,7 @@ calc_basic_data = [
                 amount=6000,
             ),
             buy_transaction(
-                date=datetime.date(day=11, month=9, year=2020),
+                date=dt.date(day=11, month=9, year=2020),
                 symbol="MSP",
                 quantity=500,
                 price=1.7,
@@ -346,7 +429,7 @@ calc_basic_data = [
         0.00,  # Expected dividend
         0.00,  # Expected dividend gain
         {
-            datetime.date(day=30, month=8, year=2020): {
+            dt.date(day=30, month=8, year=2020): {
                 "sell$MSP": [
                     CalculationEntry(
                         RuleType.BED_AND_BREAKFAST,
@@ -358,7 +441,7 @@ calc_basic_data = [
                         new_quantity=Decimal(9000),
                         new_pool_cost=Decimal(13500),
                         bed_and_breakfast_date_index=(
-                            datetime.date(day=11, month=9, year=2020)
+                            dt.date(day=11, month=9, year=2020)
                         ),
                     ),
                     CalculationEntry(
@@ -373,7 +456,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=11, month=9, year=2020): {
+            dt.date(day=11, month=9, year=2020): {
                 "buy$MSP": [
                     CalculationEntry(
                         RuleType.BED_AND_BREAKFAST,
@@ -394,9 +477,9 @@ calc_basic_data = [
     pytest.param(
         2020,  # tax year
         [
-            transfer_transaction(datetime.date(day=1, month=3, year=2021), 6782),
+            transfer_transaction(dt.date(day=1, month=3, year=2021), 6782),
             buy_transaction(
-                date=datetime.date(day=2, month=3, year=2021),
+                date=dt.date(day=2, month=3, year=2021),
                 symbol="FOO",
                 quantity=100,
                 price=25,
@@ -404,7 +487,7 @@ calc_basic_data = [
                 amount=-2506,
             ),
             buy_transaction(
-                date=datetime.date(day=3, month=3, year=2021),
+                date=dt.date(day=3, month=3, year=2021),
                 symbol="FOO",
                 quantity=154,
                 price=27.7,
@@ -412,7 +495,7 @@ calc_basic_data = [
                 amount=-4275.8,
             ),
             sell_transaction(
-                date=datetime.date(day=3, month=3, year=2021),
+                date=dt.date(day=3, month=3, year=2021),
                 symbol="FOO",
                 quantity=254,
                 price=28.03,
@@ -420,7 +503,7 @@ calc_basic_data = [
                 amount=7104.62,
             ),
             buy_transaction(
-                date=datetime.date(day=6, month=3, year=2021),
+                date=dt.date(day=6, month=3, year=2021),
                 symbol="FOO",
                 quantity=90,
                 price=28,
@@ -428,7 +511,7 @@ calc_basic_data = [
                 amount=-2525,
             ),
             sell_transaction(
-                date=datetime.date(day=6, month=3, year=2021),
+                date=dt.date(day=6, month=3, year=2021),
                 symbol="FOO",
                 quantity=90,
                 price=27,
@@ -445,7 +528,7 @@ calc_basic_data = [
         0.00,  # Expected dividend
         0.00,  # Expected dividend gain
         {
-            datetime.date(day=2, month=3, year=2021): {
+            dt.date(day=2, month=3, year=2021): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -458,7 +541,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=3, month=3, year=2021): {
+            dt.date(day=3, month=3, year=2021): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -493,7 +576,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=6, month=3, year=2021): {
+            dt.date(day=6, month=3, year=2021): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -526,9 +609,9 @@ calc_basic_data = [
     pytest.param(
         2020,  # tax year
         [
-            transfer_transaction(datetime.date(day=1, month=3, year=2021), 6782),
+            transfer_transaction(dt.date(day=1, month=3, year=2021), 6782),
             buy_transaction(
-                date=datetime.date(day=2, month=3, year=2021),
+                date=dt.date(day=2, month=3, year=2021),
                 symbol="FOO",
                 quantity=100,
                 price=25,
@@ -536,7 +619,7 @@ calc_basic_data = [
                 amount=-2506,
             ),
             buy_transaction(
-                date=datetime.date(day=3, month=3, year=2021),
+                date=dt.date(day=3, month=3, year=2021),
                 symbol="FOO",
                 quantity=154,
                 price=27.7,
@@ -544,7 +627,7 @@ calc_basic_data = [
                 amount=-4275.8,
             ),
             sell_transaction(
-                date=datetime.date(day=3, month=3, year=2021),
+                date=dt.date(day=3, month=3, year=2021),
                 symbol="FOO",
                 quantity=254,
                 price=28.03,
@@ -552,7 +635,7 @@ calc_basic_data = [
                 amount=7104.62,
             ),
             buy_transaction(
-                date=datetime.date(day=6, month=3, year=2021),
+                date=dt.date(day=6, month=3, year=2021),
                 symbol="FOO",
                 quantity=90,
                 price=28,
@@ -560,7 +643,7 @@ calc_basic_data = [
                 amount=-2525,
             ),
             sell_transaction(
-                date=datetime.date(day=6, month=3, year=2021),
+                date=dt.date(day=6, month=3, year=2021),
                 symbol="FOO",
                 quantity=90,
                 price=27,
@@ -568,7 +651,7 @@ calc_basic_data = [
                 amount=2425,
             ),
             buy_transaction(
-                date=datetime.date(day=2, month=4, year=2021),
+                date=dt.date(day=2, month=4, year=2021),
                 symbol="FOO",
                 quantity=30.5,
                 price=30.2,
@@ -585,7 +668,7 @@ calc_basic_data = [
         0.00,  # Expected dividend
         0.00,  # Expected dividend gain
         {
-            datetime.date(day=2, month=3, year=2021): {
+            dt.date(day=2, month=3, year=2021): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -598,7 +681,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=3, month=3, year=2021): {
+            dt.date(day=3, month=3, year=2021): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -631,7 +714,7 @@ calc_basic_data = [
                         new_quantity=Decimal("69.5"),
                         new_pool_cost=Decimal("1741.67"),
                         bed_and_breakfast_date_index=(
-                            datetime.date(day=2, month=4, year=2021)
+                            dt.date(day=2, month=4, year=2021)
                         ),
                     ),
                     CalculationEntry(
@@ -646,7 +729,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=6, month=3, year=2021): {
+            dt.date(day=6, month=3, year=2021): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -671,7 +754,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=2, month=4, year=2021): {
+            dt.date(day=2, month=4, year=2021): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.BED_AND_BREAKFAST,
@@ -692,9 +775,9 @@ calc_basic_data = [
     pytest.param(
         2020,  # tax year
         [
-            transfer_transaction(datetime.date(day=1, month=3, year=2021), 6782),
+            transfer_transaction(dt.date(day=1, month=3, year=2021), 6782),
             buy_transaction(
-                date=datetime.date(day=2, month=3, year=2021),
+                date=dt.date(day=2, month=3, year=2021),
                 symbol="FOO",
                 quantity=100,
                 price=25,
@@ -702,7 +785,7 @@ calc_basic_data = [
                 amount=-2506,
             ),
             buy_transaction(
-                date=datetime.date(day=3, month=3, year=2021),
+                date=dt.date(day=3, month=3, year=2021),
                 symbol="FOO",
                 quantity=154,
                 price=27.7,
@@ -710,7 +793,7 @@ calc_basic_data = [
                 amount=-4275.8,
             ),
             sell_transaction(
-                date=datetime.date(day=3, month=3, year=2021),
+                date=dt.date(day=3, month=3, year=2021),
                 symbol="FOO",
                 quantity=254,
                 price=28.03,
@@ -718,7 +801,7 @@ calc_basic_data = [
                 amount=7104.62,
             ),
             buy_transaction(
-                date=datetime.date(day=5, month=3, year=2021),
+                date=dt.date(day=5, month=3, year=2021),
                 symbol="FOO",
                 quantity=90,
                 price=28,
@@ -726,7 +809,7 @@ calc_basic_data = [
                 amount=-2525,
             ),
             sell_transaction(
-                date=datetime.date(day=6, month=3, year=2021),
+                date=dt.date(day=6, month=3, year=2021),
                 symbol="FOO",
                 quantity=90,
                 price=27,
@@ -734,7 +817,7 @@ calc_basic_data = [
                 amount=2425,
             ),
             buy_transaction(
-                date=datetime.date(day=2, month=4, year=2021),
+                date=dt.date(day=2, month=4, year=2021),
                 symbol="FOO",
                 quantity=30.5,
                 price=30.2,
@@ -751,7 +834,7 @@ calc_basic_data = [
         0.00,  # Expected dividend
         0.00,  # Expected dividend gain
         {
-            datetime.date(day=2, month=3, year=2021): {
+            dt.date(day=2, month=3, year=2021): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -764,7 +847,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=3, month=3, year=2021): {
+            dt.date(day=3, month=3, year=2021): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -797,7 +880,7 @@ calc_basic_data = [
                         new_quantity=Decimal(10),
                         new_pool_cost=Decimal("250.60"),
                         bed_and_breakfast_date_index=(
-                            datetime.date(day=5, month=3, year=2021)
+                            dt.date(day=5, month=3, year=2021)
                         ),
                     ),
                     CalculationEntry(
@@ -811,12 +894,12 @@ calc_basic_data = [
                         new_quantity=Decimal(0),
                         new_pool_cost=Decimal(0),
                         bed_and_breakfast_date_index=(
-                            datetime.date(day=2, month=4, year=2021)
+                            dt.date(day=2, month=4, year=2021)
                         ),
                     ),
                 ],
             },
-            datetime.date(day=5, month=3, year=2021): {
+            dt.date(day=5, month=3, year=2021): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.BED_AND_BREAKFAST,
@@ -829,7 +912,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=6, month=3, year=2021): {
+            dt.date(day=6, month=3, year=2021): {
                 "sell$FOO": [
                     CalculationEntry(
                         RuleType.BED_AND_BREAKFAST,
@@ -841,7 +924,7 @@ calc_basic_data = [
                         new_quantity=Decimal("69.5"),
                         new_pool_cost=Decimal("1741.6700"),
                         bed_and_breakfast_date_index=(
-                            datetime.date(day=2, month=4, year=2021)
+                            dt.date(day=2, month=4, year=2021)
                         ),
                     ),
                     CalculationEntry(
@@ -856,7 +939,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=2, month=4, year=2021): {
+            dt.date(day=2, month=4, year=2021): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.BED_AND_BREAKFAST,
@@ -877,9 +960,9 @@ calc_basic_data = [
     pytest.param(
         2023,  # tax year
         [
-            transfer_transaction(datetime.date(day=1, month=1, year=2023), 52503),
+            transfer_transaction(dt.date(day=1, month=1, year=2023), 52503),
             buy_transaction(
-                date=datetime.date(day=1, month=1, year=2023),
+                date=dt.date(day=1, month=1, year=2023),
                 symbol="FOO",
                 quantity=500,
                 price=101.1,
@@ -887,7 +970,7 @@ calc_basic_data = [
                 amount=-50551,
             ),
             sell_transaction(
-                date=datetime.date(day=25, month=6, year=2023),
+                date=dt.date(day=25, month=6, year=2023),
                 symbol="FOO",
                 quantity=30,
                 price=100,
@@ -895,7 +978,7 @@ calc_basic_data = [
                 amount=2999,
             ),
             buy_transaction(
-                date=datetime.date(day=30, month=6, year=2023),
+                date=dt.date(day=30, month=6, year=2023),
                 symbol="FOO",
                 quantity=50,
                 price=99,
@@ -903,7 +986,7 @@ calc_basic_data = [
                 amount=-4951,
             ),
             sell_transaction(
-                date=datetime.date(day=30, month=6, year=2023),
+                date=dt.date(day=30, month=6, year=2023),
                 symbol="FOO",
                 quantity=100,
                 price=100,
@@ -920,7 +1003,7 @@ calc_basic_data = [
         0.00,  # Expected dividend
         0.00,  # Expected dividend gain
         {
-            datetime.date(day=25, month=6, year=2023): {
+            dt.date(day=25, month=6, year=2023): {
                 "sell$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -934,7 +1017,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=30, month=6, year=2023): {
+            dt.date(day=30, month=6, year=2023): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -977,9 +1060,9 @@ calc_basic_data = [
     pytest.param(
         2023,  # tax year
         [
-            transfer_transaction(datetime.date(day=1, month=1, year=2023), 52503),
+            transfer_transaction(dt.date(day=1, month=1, year=2023), 52503),
             buy_transaction(
-                date=datetime.date(day=1, month=1, year=2023),
+                date=dt.date(day=1, month=1, year=2023),
                 symbol="FOO",
                 quantity=500,
                 price=101.1,
@@ -987,7 +1070,7 @@ calc_basic_data = [
                 amount=-50551,
             ),
             sell_transaction(
-                date=datetime.date(day=25, month=6, year=2023),
+                date=dt.date(day=25, month=6, year=2023),
                 symbol="FOO",
                 quantity=30,
                 price=100,
@@ -995,7 +1078,7 @@ calc_basic_data = [
                 amount=2999,
             ),
             buy_transaction(
-                date=datetime.date(day=30, month=6, year=2023),
+                date=dt.date(day=30, month=6, year=2023),
                 symbol="FOO",
                 quantity=50,
                 price=99,
@@ -1003,7 +1086,7 @@ calc_basic_data = [
                 amount=-4951,
             ),
             sell_transaction(
-                date=datetime.date(day=30, month=6, year=2023),
+                date=dt.date(day=30, month=6, year=2023),
                 symbol="FOO",
                 quantity=100,
                 price=100,
@@ -1011,7 +1094,7 @@ calc_basic_data = [
                 amount=9999,
             ),
             buy_transaction(
-                date=datetime.date(day=1, month=7, year=2023),
+                date=dt.date(day=1, month=7, year=2023),
                 symbol="FOO",
                 quantity=50,
                 price=99,
@@ -1028,7 +1111,7 @@ calc_basic_data = [
         0.00,  # Expected dividend
         0.00,  # Expected dividend gain
         {
-            datetime.date(day=25, month=6, year=2023): {
+            dt.date(day=25, month=6, year=2023): {
                 "sell$FOO": [
                     CalculationEntry(
                         RuleType.BED_AND_BREAKFAST,
@@ -1039,13 +1122,11 @@ calc_basic_data = [
                         fees=Decimal("1.0"),
                         new_quantity=Decimal(470),
                         new_pool_cost=Decimal("47517.94"),
-                        bed_and_breakfast_date_index=datetime.date(
-                            day=1, month=7, year=2023
-                        ),
+                        bed_and_breakfast_date_index=dt.date(day=1, month=7, year=2023),
                     ),
                 ],
             },
-            datetime.date(day=30, month=6, year=2023): {
+            dt.date(day=30, month=6, year=2023): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -1078,9 +1159,7 @@ calc_basic_data = [
                         fees=Decimal("0.2"),
                         new_quantity=Decimal(450),
                         new_pool_cost=Decimal("45495.9"),
-                        bed_and_breakfast_date_index=datetime.date(
-                            day=1, month=7, year=2023
-                        ),
+                        bed_and_breakfast_date_index=dt.date(day=1, month=7, year=2023),
                     ),
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -1094,7 +1173,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=1, month=7, year=2023): {
+            dt.date(day=1, month=7, year=2023): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.BED_AND_BREAKFAST,
@@ -1115,9 +1194,9 @@ calc_basic_data = [
     pytest.param(
         2023,  # tax year
         [
-            transfer_transaction(datetime.date(day=1, month=5, year=2020), 100),
+            transfer_transaction(dt.date(day=1, month=5, year=2020), 100),
             buy_transaction(
-                date=datetime.date(day=2, month=5, year=2023),
+                date=dt.date(day=2, month=5, year=2023),
                 symbol="FOO",
                 quantity=12,
                 price=5,
@@ -1125,7 +1204,7 @@ calc_basic_data = [
                 fees=0,
             ),
             sell_transaction(
-                date=datetime.date(day=10, month=5, year=2023),
+                date=dt.date(day=10, month=5, year=2023),
                 symbol="FOO",
                 quantity=2,
                 price=6,
@@ -1133,12 +1212,12 @@ calc_basic_data = [
                 fees=0,
             ),
             split_transaction(
-                date=datetime.date(day=15, month=5, year=2023),
+                date=dt.date(day=15, month=5, year=2023),
                 symbol="FOO",
                 quantity=10,  # 2x split
             ),
             sell_transaction(
-                date=datetime.date(day=10, month=6, year=2023),
+                date=dt.date(day=10, month=6, year=2023),
                 symbol="FOO",
                 quantity=2,
                 price=5,
@@ -1155,7 +1234,7 @@ calc_basic_data = [
         0.00,  # Expected dividend
         0.00,  # Expected dividend gain
         {
-            datetime.date(day=2, month=5, year=2023): {
+            dt.date(day=2, month=5, year=2023): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -1168,7 +1247,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=10, month=5, year=2023): {
+            dt.date(day=10, month=5, year=2023): {
                 "sell$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -1182,11 +1261,14 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=15, month=5, year=2023): {
-                "buy$FOO": [
+            dt.date(day=15, month=5, year=2023): {
+                # A reorganisation, not a free acquisition: nothing is bought
+                # or sold, the pool cost is untouched, and only the number of
+                # units it is spread over changes (TCGA 1992 s127).
+                "split$FOO": [
                     CalculationEntry(
-                        RuleType.SECTION_104,
-                        quantity=Decimal(10),
+                        RuleType.STOCK_SPLIT,
+                        quantity=Decimal(0),
                         amount=Decimal(0),
                         allowable_cost=Decimal(0),
                         new_quantity=Decimal(20),
@@ -1195,7 +1277,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=10, month=6, year=2023): {
+            dt.date(day=10, month=6, year=2023): {
                 "sell$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -1216,9 +1298,9 @@ calc_basic_data = [
     pytest.param(
         2023,  # tax year
         [
-            transfer_transaction(datetime.date(day=1, month=5, year=2020), 100),
+            transfer_transaction(dt.date(day=1, month=5, year=2020), 100),
             buy_transaction(
-                date=datetime.date(day=7, month=4, year=2023),
+                date=dt.date(day=7, month=4, year=2023),
                 symbol="FOO",
                 quantity=12,
                 price=5,
@@ -1226,24 +1308,24 @@ calc_basic_data = [
                 fees=0,
             ),
             sell_transaction(
-                date=datetime.date(day=10, month=5, year=2023),
+                date=dt.date(day=10, month=5, year=2023),
                 symbol="FOO",
                 quantity=2,
                 price=6,
-                amount=12,  # 2.00 gain
+                amount=12,  # 2.00 gain before B&B matching; realised result is -3.00
                 fees=0,
             ),
             split_transaction(
-                date=datetime.date(day=15, month=5, year=2023),
+                date=dt.date(day=15, month=5, year=2023),
                 symbol="FOO",
                 quantity=10,  # 2x split
             ),
             buy_transaction(
-                date=datetime.date(day=8, month=6, year=2023),
+                date=dt.date(day=8, month=6, year=2023),
                 symbol="FOO",
                 quantity=2,
                 price=5,
-                amount=-10,  # 5.00 gain
+                amount=-10,  # B&B matched against the 10 May sell
                 fees=0,
             ),
         ],
@@ -1256,7 +1338,7 @@ calc_basic_data = [
         0.00,  # Expected dividend
         0.00,  # Expected dividend gain
         {
-            datetime.date(day=7, month=4, year=2023): {
+            dt.date(day=7, month=4, year=2023): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.SECTION_104,
@@ -1269,7 +1351,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=10, month=5, year=2023): {
+            dt.date(day=10, month=5, year=2023): {
                 "sell$FOO": [
                     CalculationEntry(
                         RuleType.BED_AND_BREAKFAST,
@@ -1281,7 +1363,7 @@ calc_basic_data = [
                         new_quantity=Decimal(11),
                         new_pool_cost=Decimal(55),
                         bed_and_breakfast_date_index=(
-                            datetime.date(day=8, month=6, year=2023)
+                            dt.date(day=8, month=6, year=2023)
                         ),
                     ),
                     CalculationEntry(
@@ -1296,11 +1378,14 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=15, month=5, year=2023): {
-                "buy$FOO": [
+            dt.date(day=15, month=5, year=2023): {
+                # A reorganisation, not a free acquisition: nothing is bought
+                # or sold, the pool cost is untouched, and only the number of
+                # units it is spread over changes (TCGA 1992 s127).
+                "split$FOO": [
                     CalculationEntry(
-                        RuleType.SECTION_104,
-                        quantity=Decimal(10),
+                        RuleType.STOCK_SPLIT,
+                        quantity=Decimal(0),
                         amount=Decimal(0),
                         allowable_cost=Decimal(0),
                         new_quantity=Decimal(20),
@@ -1309,7 +1394,7 @@ calc_basic_data = [
                     ),
                 ],
             },
-            datetime.date(day=8, month=6, year=2023): {
+            dt.date(day=8, month=6, year=2023): {
                 "buy$FOO": [
                     CalculationEntry(
                         RuleType.BED_AND_BREAKFAST,
@@ -1325,5 +1410,343 @@ calc_basic_data = [
         },
         {},  # Calculation Log Other
         id="split_then_bnb",
+    ),
+    pytest.param(
+        2019,  # tax year
+        [
+            transfer_transaction(dt.date(day=1, month=1, year=2019), 1000),
+            # The pool as HMRC's example starts it: 8,000 tokens costing £1,000.
+            buy_transaction(
+                date=dt.date(day=1, month=1, year=2019),
+                symbol="TOK",
+                quantity=8000,
+                price=0.125,
+                fees=0,
+                amount=-1000,
+            ),
+            # Everything below happens on one day, so the same day rule applies
+            # to all of it before the pool is touched at all.
+            sell_transaction(
+                date=dt.date(day=31, month=1, year=2020),
+                symbol="TOK",
+                quantity=5000,
+                price=0.1,
+                fees=0,
+                amount=500,
+            ),
+            buy_transaction(
+                date=dt.date(day=31, month=1, year=2020),
+                symbol="TOK",
+                quantity=4000,
+                price=0.08,
+                fees=0,
+                amount=-320,
+            ),
+            buy_transaction(
+                date=dt.date(day=31, month=1, year=2020),
+                symbol="TOK",
+                quantity=1000,
+                price=0.075,
+                fees=0,
+                amount=-75,
+            ),
+            buy_transaction(
+                date=dt.date(day=31, month=1, year=2020),
+                symbol="TOK",
+                quantity=1000,
+                price=0.07,
+                fees=0,
+                amount=-70,
+            ),
+            sell_transaction(
+                date=dt.date(day=31, month=1, year=2020),
+                symbol="TOK",
+                quantity=2000,
+                price=0.071,
+                fees=0,
+                amount=142,
+            ),
+            buy_transaction(
+                date=dt.date(day=31, month=1, year=2020),
+                symbol="TOK",
+                quantity=500,
+                price=0.07,
+                fees=0,
+                amount=-35,
+            ),
+        ],
+        # Consideration £642 less same-day costs £500 less the pool's share of
+        # the remaining 500 tokens, £1,000 x 500/8,000 = £62.50.
+        # HMRC rounds that to £63 and publishes the gain as £79.
+        79.50,  # Expected capital gain/loss
+        None,  # Expected unrealized gains
+        None,  # GBP/USD prices
+        None,  # Current prices
+        0.00,  # Expected UK interest
+        0.00,  # Expected foreign interest
+        0.00,  # Expected dividend
+        0.00,  # Expected dividend gain
+        None,  # Calculation Log
+        {},  # Calculation Log Other
+        # https://www.gov.uk/hmrc-internal-manuals/cryptoassets-manual/crypto22254
+        id="CRYPTO22254_Example_4",
+    ),
+    pytest.param(
+        2020,  # tax year
+        [
+            transfer_transaction(dt.date(day=1, month=1, year=2020), 345000),
+            # Opening pool: 100,000 tokens for £300,000.
+            buy_transaction(
+                date=dt.date(day=1, month=1, year=2020),
+                symbol="TOK",
+                quantity=100000,
+                price=3.0,
+                fees=0,
+                amount=-300000,
+            ),
+            buy_transaction(
+                date=dt.date(day=31, month=7, year=2020),
+                symbol="TOK",
+                quantity=10000,
+                price=4.5,
+                fees=0,
+                amount=-45000,
+            ),
+            sell_transaction(
+                date=dt.date(day=31, month=7, year=2020),
+                symbol="TOK",
+                quantity=30000,
+                price=5.0,
+                fees=0,
+                amount=150000,
+            ),
+            sell_transaction(
+                date=dt.date(day=5, month=8, year=2020),
+                symbol="TOK",
+                quantity=20000,
+                price=5.0,
+                fees=0,
+                amount=100000,
+            ),
+            # One acquisition feeding the 30 day rule for two earlier
+            # disposals, with what is left over going to the pool.
+            buy_transaction(
+                date=dt.date(day=6, month=8, year=2020),
+                symbol="TOK",
+                quantity=50000,
+                price=4.5,
+                fees=0,
+                amount=-225000,
+            ),
+            sell_transaction(
+                date=dt.date(day=7, month=8, year=2020),
+                symbol="TOK",
+                quantity=100000,
+                price=1.5,
+                fees=0,
+                amount=150000,
+            ),
+        ],
+        # 31 July: £150,000 less £45,000 same day less £90,000 under the 30 day
+        #          rule = £15,000
+        # 5 August: £100,000 less £90,000 under the 30 day rule = £10,000
+        # 7 August: £150,000 less the pool's £313,636 = a loss of £163,636
+        # HMRC rounds the pool cost to £313,637 and states the loss as £163,637.
+        -138636.36,  # Expected capital gain/loss
+        None,  # Expected unrealized gains
+        None,  # GBP/USD prices
+        None,  # Current prices
+        0.00,  # Expected UK interest
+        0.00,  # Expected foreign interest
+        0.00,  # Expected dividend
+        0.00,  # Expected dividend gain
+        None,  # Calculation Log
+        {},  # Calculation Log Other
+        # https://www.gov.uk/hmrc-internal-manuals/cryptoassets-manual/crypto22256
+        id="CRYPTO22256_Example_6",
+    ),
+    pytest.param(
+        2020,  # tax year
+        [
+            transfer_transaction(dt.date(day=1, month=1, year=2020), 126000),
+            # Opening pool: 100 tokens for £1,000.
+            buy_transaction(
+                date=dt.date(day=1, month=1, year=2020),
+                symbol="TOK",
+                quantity=100,
+                price=10.0,
+                fees=0,
+                amount=-1000,
+            ),
+            buy_transaction(
+                date=dt.date(day=18, month=9, year=2020),
+                symbol="TOK",
+                quantity=50,
+                price=2500.0,
+                fees=0,
+                amount=-125000,
+            ),
+            sell_transaction(
+                date=dt.date(day=1, month=12, year=2020),
+                symbol="TOK",
+                quantity=50,
+                price=6000.0,
+                fees=0,
+                amount=300000,
+            ),
+        ],
+        # £300,000 less the pool's share, £126,000 x 50/150 = £42,000.
+        258000.00,  # Expected capital gain/loss
+        None,  # Expected unrealized gains
+        None,  # GBP/USD prices
+        None,  # Current prices
+        0.00,  # Expected UK interest
+        0.00,  # Expected foreign interest
+        0.00,  # Expected dividend
+        0.00,  # Expected dividend gain
+        None,  # Calculation Log
+        {},  # Calculation Log Other
+        # https://www.gov.uk/hmrc-internal-manuals/cryptoassets-manual/crypto22251
+        id="CRYPTO22251_Example_1",
+    ),
+    pytest.param(
+        2020,  # tax year
+        [
+            transfer_transaction(dt.date(day=1, month=1, year=2020), 1500),
+            # Opening pool: 5,000 tokens for £500.
+            buy_transaction(
+                date=dt.date(day=1, month=1, year=2020),
+                symbol="TOK",
+                quantity=5000,
+                price=0.1,
+                fees=0,
+                amount=-500,
+            ),
+            # Two disposals and an acquisition on one day. The disposals are
+            # treated as one, and the acquisition is matched against it.
+            sell_transaction(
+                date=dt.date(day=23, month=6, year=2020),
+                symbol="TOK",
+                quantity=1000,
+                price=0.8,
+                fees=0,
+                amount=800,
+            ),
+            buy_transaction(
+                date=dt.date(day=23, month=6, year=2020),
+                symbol="TOK",
+                quantity=1600,
+                price=0.625,
+                fees=0,
+                amount=-1000,
+            ),
+            sell_transaction(
+                date=dt.date(day=23, month=6, year=2020),
+                symbol="TOK",
+                quantity=500,
+                price=1.2,
+                fees=0,
+                amount=600,
+            ),
+        ],
+        # £1,400 less £1,000 x 1,500/1,600 = £937.50. The 100 tokens left
+        # over join the pool at £62.50.
+        # HMRC rounds the cost to £938 and publishes the gain as £462.
+        462.50,  # Expected capital gain/loss
+        None,  # Expected unrealized gains
+        None,  # GBP/USD prices
+        None,  # Current prices
+        0.00,  # Expected UK interest
+        0.00,  # Expected foreign interest
+        0.00,  # Expected dividend
+        0.00,  # Expected dividend gain
+        None,  # Calculation Log
+        {},  # Calculation Log Other
+        # https://www.gov.uk/hmrc-internal-manuals/cryptoassets-manual/crypto22252
+        id="CRYPTO22252_Example_2",
+    ),
+    pytest.param(
+        2020,  # tax year
+        CRYPTO22253_TRANSACTIONS,
+        # The 31 March disposal falls in this year: £400 less 700 tokens at
+        # £175 and 300 at £60, both acquired inside the next 30 days but in
+        # the *following* tax year. The rule reaches across the year end.
+        165.00,  # Expected capital gain/loss
+        None,  # Expected unrealized gains
+        None,  # GBP/USD prices
+        None,  # Current prices
+        0.00,  # Expected UK interest
+        0.00,  # Expected foreign interest
+        0.00,  # Expected dividend
+        0.00,  # Expected dividend gain
+        None,  # Calculation Log
+        {},  # Calculation Log Other
+        # https://www.gov.uk/hmrc-internal-manuals/cryptoassets-manual/crypto22253
+        id="CRYPTO22253_Example_3_first_year",
+    ),
+    pytest.param(
+        2021,  # tax year
+        CRYPTO22253_TRANSACTIONS,
+        # The 20 April disposal falls in the next year: £150 less 200 tokens
+        # at £40 and 300 at £90.
+        20.00,  # Expected capital gain/loss
+        None,  # Expected unrealized gains
+        None,  # GBP/USD prices
+        None,  # Current prices
+        0.00,  # Expected UK interest
+        0.00,  # Expected foreign interest
+        0.00,  # Expected dividend
+        0.00,  # Expected dividend gain
+        None,  # Calculation Log
+        {},  # Calculation Log Other
+        # https://www.gov.uk/hmrc-internal-manuals/cryptoassets-manual/crypto22253
+        id="CRYPTO22253_Example_3_second_year",
+    ),
+    pytest.param(
+        2020,  # tax year
+        [
+            transfer_transaction(dt.date(day=1, month=1, year=2020), 200000),
+            # Opening pool: 14,000 tokens for £200,000.
+            buy_transaction(
+                date=dt.date(day=1, month=1, year=2020),
+                symbol="TOK",
+                quantity=14000,
+                price=14.285714,
+                fees=0,
+                amount=-200000,
+            ),
+            sell_transaction(
+                date=dt.date(day=30, month=8, year=2020),
+                symbol="TOK",
+                quantity=4000,
+                price=40.0,
+                fees=0,
+                amount=160000,
+            ),
+            # Bought inside 30 days, so 500 of the 4,000 sold match here rather
+            # than against the pool.
+            buy_transaction(
+                date=dt.date(day=11, month=9, year=2020),
+                symbol="TOK",
+                quantity=500,
+                price=35.0,
+                fees=0,
+                amount=-17500,
+            ),
+        ],
+        # £160,000 less £17,500 for the 500 matched under the 30 day rule,
+        # less £50,000 for the 3,500 taken from the pool.
+        92500.00,  # Expected capital gain/loss
+        None,  # Expected unrealized gains
+        None,  # GBP/USD prices
+        None,  # Current prices
+        0.00,  # Expected UK interest
+        0.00,  # Expected foreign interest
+        0.00,  # Expected dividend
+        0.00,  # Expected dividend gain
+        None,  # Calculation Log
+        {},  # Calculation Log Other
+        # https://www.gov.uk/hmrc-internal-manuals/cryptoassets-manual/crypto22255
+        id="CRYPTO22255_Example_5",
     ),
 ]

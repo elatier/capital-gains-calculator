@@ -1,5 +1,9 @@
 *.aux
 *.log
+.coverage
+.coverage.*
+coverage.xml
+junit.xml
 .DS_Store
 .mypy_cache/
 .pytest_cache/
@@ -10,3 +14,7 @@ __pycache__
 env
 dist
 out/
+site/
+.wrangler/
+exchange_rates.csv
+.lycheecache

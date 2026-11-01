@@ -1,8 +1,0 @@
-{
-    "replacementPatterns": [
-        {
-            "pattern": "^#%EF%B8%8F-",
-            "replacement": "#-"
-        }
-    ]
-}

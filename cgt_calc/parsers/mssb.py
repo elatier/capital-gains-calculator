@@ -1,20 +1,21 @@
-"""Morgan Stanley parser.
+"""Parse the Morgan Stanley at Work report format used for Alphabet awards.
 
-Note, that I only had access to an Alphabet export. I have no idea how it looks like
-for another company, or for a full profile.
+The importer has only been validated against an Alphabet ``GSU Class C``
+export. It is not a general parser for other employers or Morgan Stanley
+brokerage accounts.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import datetime
-from decimal import Decimal, InvalidOperation
+import datetime as dt
+from decimal import Decimal
 from enum import StrEnum
-from typing import TYPE_CHECKING, ClassVar, Final, TextIO
+from typing import TYPE_CHECKING, ClassVar, Final, TextIO, override
 
-from cgt_calc.const import TICKER_RENAMES
 from cgt_calc.exceptions import ParsingError
-from cgt_calc.model import ActionType, BrokerTransaction
+from cgt_calc.model import ActionType, BrokerTransaction, CurrencyCode
+from cgt_calc.util import parse_decimal
 
 from .base_parsers import BaseDirParser, StandardCSVParser
 
@@ -69,32 +70,33 @@ KNOWN_SYMBOL_DICT: Final[dict[str, str]] = {
 
 @dataclass
 class StockSplit:
-    """Info about stock split."""
+    """A split whose earlier sales the withdrawal report leaves in old units."""
 
     symbol: str
-    date: datetime.date
+    date: dt.date
+    """Last day on which the report prints sales in pre-split units.
+
+    Morgan Stanley's notice puts sales "on or prior to" the split date in
+    pre-split values, so this is the split date itself rather than the first
+    date treated as post-split by the Schwab parser's ``SPLITS`` table.
+    """
     factor: int
 
 
 STOCK_SPLIT_INFO = [
-    StockSplit(symbol="GOOG", date=datetime.datetime(2022, 6, 15).date(), factor=20),
+    StockSplit(symbol="GOOG", date=dt.datetime(2022, 7, 15).date(), factor=20),
 ]
 
 
 def _parse_decimal(row: dict[str, str], column: StrEnum) -> Decimal:
     """Parse a decimal from the given row, annotating errors with column context."""
 
-    value = row[column]
-    cleaned = value.replace(",", "").replace("$", "")
-    try:
-        return Decimal(cleaned)
-    except InvalidOperation as err:
-        raise ValueError(
-            f"Invalid decimal in column '{column.value}': {value!r}"
-        ) from err
+    return parse_decimal(row[column], f"column '{column.value}'", strip=",$")
 
 
-class MSSBParser(StandardCSVParser, BaseDirParser):
+class MSSBParser(
+    StandardCSVParser[BrokerTransaction], BaseDirParser[BrokerTransaction]
+):
     """Morgan Stanley parser."""
 
     arg_name = "mssb"
@@ -102,28 +104,43 @@ class MSSBParser(StandardCSVParser, BaseDirParser):
     format_name = "CSV"
     glob_dir = "*.csv"
     deprecated_flags: ClassVar[list[str]] = ["--mssb"]
+    # Morgan Stanley loads as it did before the check for a transaction in
+    # two files was added: that change covered Hargreaves Lansdown and
+    # Sharesight only. The two reports are read by fixed name and never hold
+    # the same transaction. Only two names that differ in nothing but their
+    # case, on a file system that tells them apart, are read as two copies
+    # of one report, and counted twice.
+    refuses_transaction_in_two_files: ClassVar[bool] = False
+
+    @staticmethod
+    def _is_withdrawals_report(file_path: Path) -> bool:
+        """Return whether the path is a withdrawals report."""
+        return file_path.name.casefold() == WITHDRAWALS_REPORT_FILENAME.casefold()
 
     @classmethod
+    @override
     def file_path_filter(cls, file_path: Path) -> bool:
         """Choose which files to parse."""
-        return file_path.name in [
-            WITHDRAWALS_REPORT_FILENAME,
-            RELEASES_REPORT_FILENAME,
-        ]
+        return file_path.name.casefold() in {
+            WITHDRAWALS_REPORT_FILENAME.casefold(),
+            RELEASES_REPORT_FILENAME.casefold(),
+        }
 
     @classmethod
-    def pre_reading(cls, file: TextIO, file_path: Path) -> Iterable[str]:
-        """Do any preprocessing of the file before parsing the csv."""
-        if file_path.name == WITHDRAWALS_REPORT_FILENAME:
+    @override
+    def pre_reading(cls, file: TextIO, file_path: Path) -> tuple[Iterable[str], int]:
+        """Select the expected column set based on the report filename."""
+        if cls._is_withdrawals_report(file_path):
             cls.columns = set(COLUMNS_WITHDRAWAL)
         else:
             cls.columns = set(COLUMNS_RELEASE)
-        return file
+        return file, 1
 
     @classmethod
+    @override
     def read_row(cls, row: dict[str, str], file_path: Path) -> BrokerTransaction | None:
         """Read a single transaction from a row in the CSV."""
-        if file_path.name == WITHDRAWALS_REPORT_FILENAME:
+        if cls._is_withdrawals_report(file_path):
             return cls._init_from_withdrawal_report(row, file_path)
         return cls._init_from_release_report(row, file_path)
 
@@ -154,12 +171,9 @@ class MSSBParser(StandardCSVParser, BaseDirParser):
         price = _parse_decimal(row, ReleaseColumn.PRICE)
         amount = quantity * price
         symbol = KNOWN_SYMBOL_DICT[plan]
-        symbol = TICKER_RENAMES.get(symbol, symbol)
 
         return BrokerTransaction(
-            date=datetime.datetime.strptime(
-                row[ReleaseColumn.VEST_DATE], "%d-%b-%Y"
-            ).date(),
+            date=dt.datetime.strptime(row[ReleaseColumn.VEST_DATE], "%d-%b-%Y").date(),
             action=ActionType.STOCK_ACTIVITY,
             symbol=symbol,
             description=plan,
@@ -167,12 +181,12 @@ class MSSBParser(StandardCSVParser, BaseDirParser):
             price=price,
             fees=Decimal(0),
             amount=amount,
-            currency="USD",
+            currency=CurrencyCode("USD"),
             broker=BROKER_NAME,
         )
 
-    # Morgan Stanley decided to put a notice in the end of the withdrawal report that looks
-    # like that:
+    # Morgan Stanley decided to put a notice at the end of the withdrawal report that looks
+    # like this:
     # "Please note that any Alphabet share sales, transfers, or deposits that occurred on
     # or prior to the July 15, 2022 stock split are reflected in pre-split. Any sales,
     # transfers, or deposits that occurred after July 15, 2022 are in post-split values.
@@ -218,18 +232,19 @@ class MSSBParser(StandardCSVParser, BaseDirParser):
         else:
             action = ActionType.SELL
 
+        symbol = KNOWN_SYMBOL_DICT[plan]
         transaction = BrokerTransaction(
-            date=datetime.datetime.strptime(
+            date=dt.datetime.strptime(
                 row[WithdrawalColumn.EXECUTION_DATE], "%d-%b-%Y"
             ).date(),
             action=action,
-            symbol=KNOWN_SYMBOL_DICT[plan],
+            symbol=symbol,
             description=plan,
             quantity=quantity,
             price=price,
             fees=fees,
             amount=amount,
-            currency="USD",
+            currency=CurrencyCode("USD"),
             broker=BROKER_NAME,
         )
 
@@ -237,11 +252,12 @@ class MSSBParser(StandardCSVParser, BaseDirParser):
 
     @staticmethod
     def _handle_stock_split(transaction: BrokerTransaction) -> BrokerTransaction:
+        """Adjust pre-split sales."""
         for split in STOCK_SPLIT_INFO:
             if (
                 transaction.symbol == split.symbol
                 and transaction.action == ActionType.SELL
-                and transaction.date < split.date
+                and transaction.date <= split.date
             ):
                 if transaction.quantity:
                     transaction.quantity *= split.factor

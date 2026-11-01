@@ -2,9 +2,58 @@
 
 from __future__ import annotations
 
+import datetime as dt
+from decimal import Decimal
 from pathlib import Path
 
-from cgt_calc.exceptions import ParsingError
+import pytest
+
+import cgt_calc.exceptions
+from cgt_calc.exceptions import (
+    AmountMissingError,
+    BundledPriceCurrencyError,
+    CalculatedAmountDiscrepancyError,
+    CalculationError,
+    CgtError,
+    ExchangeRateMissingError,
+    ExternalApiError,
+    HmrcRateMissingError,
+    InteractiveInputRequiredError,
+    InvalidTransactionError,
+    IsinMissingError,
+    IsinTranslationError,
+    LatexRenderError,
+    MarketDataMissingError,
+    MissingExternalToolError,
+    ParsingError,
+    PriceMissingError,
+    QuantityMissingError,
+    QuantityNotPositiveError,
+    SharePriceMissingError,
+    SymbolMissingError,
+    TransactionDumpError,
+    UnclassifiedGiftError,
+    UnexpectedColumnCountError,
+    UnexpectedHeaderError,
+    UnexpectedRowCountError,
+    UnsupportedBrokerCurrencyError,
+)
+from cgt_calc.model import ActionType, BrokerTransaction, CurrencyCode
+
+DATE = dt.date(2023, 1, 1)
+
+TRANSACTION = BrokerTransaction(
+    date=DATE,
+    action=ActionType.BUY,
+    symbol="FOO",
+    description="test",
+    quantity=Decimal(1),
+    price=Decimal(1),
+    fees=Decimal(0),
+    amount=Decimal(-1),
+    currency=CurrencyCode("USD"),
+    broker="Test",
+)
 
 
 def test_parsing_error_message_without_row() -> None:
@@ -33,3 +82,146 @@ def test_parsing_error_add_row_context_updates_message() -> None:
 
     err.add_row_context(11)
     assert str(err) == "While parsing file.csv, row 11: bad value"
+
+
+def test_add_row_context_on_parsing_error_subclass() -> None:
+    """Row context can be attached through ParsingError subclasses.
+
+    File readers catch ParsingError and call add_row_context, so the
+    machinery has to work on every subclass, not just the base class.
+    """
+    err = UnsupportedBrokerCurrencyError(Path("f.csv"), "TestBroker", "XXX")
+
+    err.add_row_context(5)
+
+    assert err.row_index == 5
+    assert "row 5" in str(err)
+
+
+# Each error paired with the inputs a user needs to locate the problem.
+# The exact wording is free to change; losing the context is a regression.
+CONTEXT_CASES: list[tuple[CgtError, list[str]]] = [
+    (
+        InvalidTransactionError(TRANSACTION, "unexpected fees"),
+        ["unexpected fees", "FOO", "2023"],
+    ),
+    (AmountMissingError(TRANSACTION), ["FOO", "2023"]),
+    (SymbolMissingError(TRANSACTION), ["FOO", "2023"]),
+    (PriceMissingError(TRANSACTION), ["FOO", "2023"]),
+    (IsinMissingError(TRANSACTION), ["FOO", "2023"]),
+    (QuantityMissingError(TRANSACTION), ["FOO", "2023"]),
+    (QuantityNotPositiveError(TRANSACTION), ["FOO", "2023"]),
+    # Both the calculated and the supplied amount are needed to see the gap.
+    (
+        CalculatedAmountDiscrepancyError(TRANSACTION, Decimal(-42), Decimal(-1)),
+        ["-42", "-1", "FOO"],
+    ),
+    (
+        UnsupportedBrokerCurrencyError(Path("f.csv"), "TestBroker", "XXX"),
+        ["f.csv", "TestBroker", "XXX"],
+    ),
+    (
+        UnexpectedColumnCountError(["only", "two"], 3, Path("f.csv")),
+        ["f.csv", "3", "only", "two"],
+    ),
+    (
+        UnexpectedHeaderError(["NEW", "OLD"], ["dst", "src"], Path("f.csv")),
+        ["f.csv", "row 1", "dst,src", "NEW,OLD"],
+    ),
+    (UnexpectedRowCountError(5, Path("f.csv")), ["f.csv", "5"]),
+    (ExchangeRateMissingError("USD", DATE), ["USD", "2023-01-01"]),
+    # The row to add, and the file to add it to.
+    (
+        HmrcRateMissingError("XAU", DATE, Path("rates.csv")),
+        ["2023-01-01,XAU,<rate>", "rates.csv"],
+    ),
+    # With no rates file, the option that names one.
+    (
+        HmrcRateMissingError("XAU", DATE, None),
+        ["Add it to a file passed with --exchange-rates-file: a CSV file"],
+    ),
+    (SharePriceMissingError("FOO", DATE), ["FOO", "2023-01-01"]),
+    (BundledPriceCurrencyError("FOO", DATE, "GBP"), ["FOO", "2023-01-01", "GBP"]),
+    (LatexRenderError(Path("render.log")), ["render.log"]),
+    (MissingExternalToolError("pdflatex"), ["pdflatex"]),
+    (IsinTranslationError("ISIN XS123 is broken"), ["ISIN XS123 is broken"]),
+    (
+        TransactionDumpError("parsed.csv already exists"),
+        ["parsed.csv already exists"],
+    ),
+    (
+        ExternalApiError("https://api.example.com/rates", "boom"),
+        ["https://api.example.com/rates", "boom"],
+    ),
+    (
+        InteractiveInputRequiredError("FOO", DATE, Path("spin_offs.csv")),
+        ["FOO", "2023-01-01", "spin_offs.csv"],
+    ),
+    (
+        MarketDataMissingError("FOO", DATE),
+        ["FOO", "2023-01-01", "--prices-file (header 'date,symbol,price')"],
+    ),
+    (
+        UnclassifiedGiftError(TRANSACTION, [Decimal(1)]),
+        # The row to paste, the shares it covers, and the other outcome.
+        [
+            "2023-01-01,TRANSFER_TO_SPOUSE,FOO,1,0.00,0.00,USD",
+            "2023-01-01,GIFT,FOO,1,<value per unit>,0.00,USD",
+            "1 units of FOO",
+            "Test",
+            "disposal at market value",
+        ],
+    ),
+    (
+        # Both readings of a count printed before a split, and why.
+        UnclassifiedGiftError(TRANSACTION, [Decimal(1), Decimal(20)]),
+        [
+            "2023-01-01,TRANSFER_TO_SPOUSE,FOO,1,0.00,0.00,USD",
+            "2023-01-01,TRANSFER_TO_SPOUSE,FOO,20,0.00,0.00,USD",
+            "either 1 or 20 shares",
+        ],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("error", "fragments"),
+    CONTEXT_CASES,
+    ids=[type(error).__name__ for error, _ in CONTEXT_CASES],
+)
+def test_error_message_contains_context(error: CgtError, fragments: list[str]) -> None:
+    """Error messages name the inputs needed to locate the problem."""
+    message = str(error)
+
+    for fragment in fragments:
+        assert fragment in message
+
+
+def test_an_api_error_without_advice_is_one_line() -> None:
+    """Advice goes on a second line; without any, there is no second line."""
+    error = ExternalApiError("https://api.example.com/rates", "boom")
+
+    assert str(error) == "boom (source: https://api.example.com/rates)"
+
+
+def test_every_exception_has_a_context_case() -> None:
+    """Every exception in the module is exercised by the context sweep.
+
+    A new exception with a broken message would otherwise only surface
+    in the failing user run that raises it.
+    """
+    bare_base_classes = {CgtError, CalculationError}
+    tested_directly = {ParsingError}
+    covered = (
+        {type(error) for error, _ in CONTEXT_CASES}
+        | bare_base_classes
+        | tested_directly
+    )
+
+    module_classes = {
+        obj
+        for obj in vars(cgt_calc.exceptions).values()
+        if isinstance(obj, type) and issubclass(obj, CgtError)
+    }
+
+    assert module_classes <= covered

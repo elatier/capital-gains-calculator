@@ -1,25 +1,72 @@
 """Test Freetrade support."""
 
 import csv
+from datetime import UTC, date, datetime
 from decimal import Decimal
+import logging
 from pathlib import Path
-import subprocess
 
 import pytest
 
-from cgt_calc.exceptions import (
-    ParsingError,
-    UnsupportedBrokerActionError,
-    UnsupportedBrokerCurrencyError,
-)
+from cgt_calc.exceptions import ParsingError, UnsupportedBrokerCurrencyError
 from cgt_calc.model import ActionType
-from cgt_calc.parsers.freetrade import (
-    COLUMNS,
-    FreetradeColumn,
-    FreetradeParser,
-    FreetradeTransaction,
+from cgt_calc.parsers.freetrade import COLUMNS, FreetradeColumn, FreetradeParser
+from tests.utils import (
+    assert_stdout_matches,
+    build_cmd,
+    report_path,
+    run_cli,
+    stderr_alerts,
 )
-from tests.utils import build_cmd
+
+# Header of a Freetrade export downloaded after the format change reported in
+# issue #800: two columns were renamed and the "Stock Split" ones are new.
+NEW_COLUMNS: list[str] = [
+    "Title",
+    "Type",
+    "Timestamp",
+    "Account Currency",
+    "Total Amount in Account Currency",
+    "Buy / Sell",
+    "Ticker",
+    "ISIN",
+    "Price per Share in Account Currency",
+    "Stamp Duty",
+    "Quantity",
+    "Venue",
+    "Order ID",
+    "Order Type",
+    "Instrument Currency",
+    "Total Amount in Instrument Currency",
+    "Price per Share",
+    "FX Rate",
+    "Base FX Rate",
+    "FX Fee (BPS)",
+    "FX Fee Amount",
+    "Dividend Ex Date",
+    "Dividend Pay Date",
+    "Dividend Eligible Quantity",
+    "Dividend Amount Per Share",
+    "Dividend Gross Distribution Amount",
+    "Dividend Net Distribution Amount",
+    "Dividend Withheld Tax Percentage",
+    "Dividend Withheld Tax Amount",
+    "Stock Split Ex Date",
+    "Stock Split Pay Date",
+    "Stock Split New ISIN",
+    "Stock Split Rate of Share Outturn From",
+    "Stock Split Rate of Share Outturn To",
+    "Stock Split Maintain Holding of Initial ISIN",
+    "Stock Split New Share Quantity",
+    "Stock Split Rate of Cash Outturn Amount",
+    "Stock Split Rate of Cash Outturn Currency",
+    "Stock Split Cash Outturn Received Amount",
+    "Stock Split Has Fractional Payout",
+    "Stock Split Rate of Fractional Payout Amount",
+    "Stock Split Rate of Fractional Payout Currency",
+    "Stock Split Fractional Payout Cash Received Amount",
+    "Stock Split Fractional Payout Cash Received Currency",
+]
 
 BASE_ROW_VALUES = {
     FreetradeColumn.TITLE.value: "Buy Apple",
@@ -53,6 +100,13 @@ BASE_ROW_VALUES = {
     FreetradeColumn.DIVIDEND_WITHHELD_AMOUNT.value: "0",
 }
 
+# The two columns Freetrade renamed, spelled out rather than read back from the
+# parser so that a wrong mapping there fails these tests.
+RENAMED_COLUMNS: dict[str, str] = {
+    FreetradeColumn.TOTAL_AMOUNT.value: "Total Amount in Account Currency",
+    FreetradeColumn.TOTAL_SHARES_AMOUNT.value: "Total Amount in Instrument Currency",
+}
+
 
 def _default_row(overrides: dict[str, str] | None = None) -> list[str]:
     """Return default row data with optional overrides."""
@@ -60,6 +114,17 @@ def _default_row(overrides: dict[str, str] | None = None) -> list[str]:
     if overrides:
         values.update(overrides)
     return [values[column] for column in COLUMNS]
+
+
+def _default_new_row(overrides: dict[str, str] | None = None) -> list[str]:
+    """Return default row data laid out for the new header."""
+    values = {
+        RENAMED_COLUMNS.get(column, column): value
+        for column, value in BASE_ROW_VALUES.items()
+    }
+    if overrides:
+        values.update(overrides)
+    return [values.get(column, "") for column in NEW_COLUMNS]
 
 
 def _write_csv(
@@ -75,30 +140,68 @@ def _write_csv(
     return target
 
 
-def test_run_with_freetrade_file() -> None:
+def test_run_with_freetrade_file(request: pytest.FixtureRequest) -> None:
     """Runs the script and verifies it doesn't fail."""
     cmd = build_cmd(
         "--year",
         "2023",
         "--freetrade-file",
         "tests/freetrade/data/transactions.csv",
+        "--output",
+        report_path(request),
     )
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode:
-        pytest.fail(
-            "Integration test failed\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
-    assert result.stderr == "", "Run with example files generated errors"
+    result = run_cli(cmd)
+    assert stderr_alerts(result.stderr) == [], "Run with example files generated errors"
     expected_file = Path("tests") / "freetrade" / "data" / "expected_output.txt"
-    expected = expected_file.read_text()
-    cmd_str = " ".join([param if param else "''" for param in cmd])
-    assert result.stdout == expected, (
-        "Run with example files generated unexpected outputs, "
-        "if you added new features update the test with:\n"
-        f"{cmd_str} > {expected_file}"
+    assert_stdout_matches(result, cmd, expected_file)
+
+
+def test_real_export_preserves_transaction_timestamp() -> None:
+    """Keep the exact instant stated by the Freetrade export."""
+    transactions = FreetradeParser.load_from_file(
+        Path("tests/freetrade/data/transactions.csv"), show_parsing_msg=False
     )
+
+    transaction = next(
+        txn for txn in transactions if txn.source and txn.source.row == 2
+    )
+
+    assert transaction.source is not None
+    assert transaction.source.timestamp == datetime(
+        2024, 1, 16, 10, 1, 2, 811000, tzinfo=UTC
+    )
+
+
+def test_a_day_s_rows_are_read_oldest_first(tmp_path: Path) -> None:
+    """Freetrade lists the newest row first, so a day's sale sits above its purchase.
+
+    Rows of one day keep the order the parser gives them, and a sale is checked
+    against the holding as it is read, so the export's own order would put this
+    sale before the shares it sells.
+    """
+    freetrade_file = _write_csv(
+        tmp_path,
+        COLUMNS,
+        [
+            _default_row(
+                {
+                    FreetradeColumn.TITLE.value: "Sell Apple",
+                    FreetradeColumn.BUY_SELL.value: "SELL",
+                    FreetradeColumn.TIMESTAMP.value: "2024-01-02T15:00:00",
+                }
+            ),
+            _default_row({FreetradeColumn.TIMESTAMP.value: "2024-01-02T10:00:00"}),
+        ],
+    )
+
+    transactions = FreetradeParser.load_from_file(
+        freetrade_file, show_parsing_msg=False
+    )
+
+    assert [transaction.action for transaction in transactions] == [
+        ActionType.BUY,
+        ActionType.SELL,
+    ]
 
 
 def test_read_freetrade_transactions_empty_file(tmp_path: Path) -> None:
@@ -106,8 +209,26 @@ def test_read_freetrade_transactions_empty_file(tmp_path: Path) -> None:
     empty_file = tmp_path / "empty.csv"
     empty_file.write_text("")
 
-    with pytest.raises(ParsingError):
+    with pytest.raises(ParsingError, match="Freetrade CSV file is empty"):
         FreetradeParser().load_from_file(empty_file)
+
+
+def test_read_freetrade_transactions_refuses_a_row_that_runs_over_several_lines(
+    tmp_path: Path,
+) -> None:
+    """A double quote left open takes in the rows below it; they are not dropped.
+
+    The quote opened on row 2 is closed by the one on row 3, so the three
+    orders would be read as two.
+    """
+    rows = [",".join(_default_row()) for _ in range(3)]
+    rows[0] = '"' + rows[0]
+    rows[1] = '"' + rows[1]
+    path = tmp_path / "freetrade.csv"
+    path.write_text("\n".join([",".join(COLUMNS), *rows]) + "\n", encoding="utf-8")
+
+    with pytest.raises(ParsingError, match=", row 2: This row runs on to row 3,"):
+        FreetradeParser().load_from_file(path)
 
 
 def test_read_freetrade_transactions_missing_column(tmp_path: Path) -> None:
@@ -140,6 +261,24 @@ def test_read_freetrade_transactions_invalid_decimal(tmp_path: Path) -> None:
         FreetradeParser().load_from_file(path)
 
 
+@pytest.mark.parametrize(
+    "row",
+    [_default_row()[:-1], [*_default_row(), "extra"]],
+    ids=["a cell short", "a cell too many"],
+)
+def test_read_freetrade_transactions_refuses_a_row_of_the_wrong_width(
+    tmp_path: Path, row: list[str]
+) -> None:
+    """A row is not read with a cell missing, nor with its extra cell dropped."""
+    path = _write_csv(tmp_path, COLUMNS, [_default_row(), row])
+
+    with pytest.raises(
+        ParsingError,
+        match=f", row 3: This row has {len(row)} columns, not {len(COLUMNS)}",
+    ):
+        FreetradeParser().load_from_file(path)
+
+
 def test_read_freetrade_transactions_unsupported_currency(tmp_path: Path) -> None:
     """Non-GBP account currencies raise a dedicated error."""
     overrides = {FreetradeColumn.ACCOUNT_CURRENCY.value: "USD"}
@@ -164,27 +303,277 @@ def test_read_freetrade_transactions_success(tmp_path: Path) -> None:
     assert transaction.symbol == "AAPL"
     assert transaction.quantity == Decimal(1)
     assert transaction.price == Decimal(100)
+    assert transaction.fees == Decimal(0)
     assert transaction.amount == Decimal(-100)
+    assert transaction.currency == "GBP"
+    assert transaction.isin == "US0378331005"
+
+
+@pytest.mark.parametrize(
+    ("ticker", "isin", "date", "expected"),
+    [
+        pytest.param("FB", "US30303M1027", "2025-07-01", "META", id="meta"),
+        pytest.param("FB", "US0378331005", "2021-06-01", "FB", id="another-security"),
+    ],
+)
+def test_a_renamed_ticker_is_read_under_its_current_name(
+    tmp_path: Path, ticker: str, isin: str, date: str, expected: str
+) -> None:
+    """A row carrying a renamed security's ISIN takes its current ticker.
+
+    The ISIN names the security, so the row's date does not matter, and the
+    same letters under another ISIN are left alone. The shared loader applies
+    the table for every parser. Freetrade owns the test because it never
+    applied the table itself, so this fails without the shared step.
+    """
+    path = _write_csv(
+        tmp_path,
+        COLUMNS,
+        [
+            _default_row(
+                {
+                    FreetradeColumn.TICKER.value: ticker,
+                    FreetradeColumn.ISIN.value: isin,
+                    # Meta's FB row is dated after another security took FB,
+                    # and the other row while FB was Meta's: only the ISIN
+                    # can decide either.
+                    FreetradeColumn.TIMESTAMP.value: f"{date}T10:00:00",
+                }
+            )
+        ],
+    )
+
+    (transaction,) = FreetradeParser().load_from_file(path)
+
+    assert transaction.symbol == expected
+
+
+def test_an_isin_tells_apart_rows_on_both_sides_of_a_ticker_changing_hands(
+    tmp_path: Path,
+) -> None:
+    """FB was Meta's until a ProShares ETF took it in June 2025.
+
+    Without ISINs these rows would be refused; with them, each row says
+    whose it is, and only Meta's takes its current ticker.
+    """
+    rows = [
+        _default_row(
+            {
+                FreetradeColumn.TICKER.value: "FB",
+                FreetradeColumn.ISIN.value: isin,
+                FreetradeColumn.TIMESTAMP.value: timestamp,
+            }
+        )
+        for isin, timestamp in [
+            ("US30303M1027", "2021-06-01T10:00:00"),
+            ("US74349Y6133", "2025-07-01T10:00:00"),
+        ]
+    ]
+    path = _write_csv(tmp_path, COLUMNS, rows)
+
+    transactions = FreetradeParser().load_from_file(path)
+
+    assert {transaction.isin: transaction.symbol for transaction in transactions} == {
+        "US30303M1027": "META",
+        "US74349Y6133": "FB",
+    }
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "expected"),
+    [
+        # The tax year boundary always falls inside BST, so the last hour
+        # of 5 April in UTC already belongs to the next tax year.
+        ("2025-04-05T22:59:59.000Z", date(2025, 4, 5)),
+        ("2025-04-05T23:00:00.000Z", date(2025, 4, 6)),
+        ("2025-04-05T23:30:00.000", date(2025, 4, 6)),
+        # The clocks go back on 25 October 2026, so the last hour of the
+        # 26th is already GMT.
+        ("2026-10-26T23:30:00.000Z", date(2026, 10, 26)),
+        # Outside summer time UK dates and UTC dates agree.
+        ("2026-01-15T23:30:00.000Z", date(2026, 1, 15)),
+        ("2026-11-01T23:30:00.000Z", date(2026, 11, 1)),
+    ],
+)
+def test_read_freetrade_transactions_uses_uk_dates(
+    tmp_path: Path, timestamp: str, expected: date
+) -> None:
+    """Take the tax date from the UK calendar, not the UTC one."""
+    overrides = {FreetradeColumn.TIMESTAMP.value: timestamp}
+    path = _write_csv(tmp_path, COLUMNS, [_default_row(overrides)])
+
+    transactions = FreetradeParser().load_from_file(path)
+
+    assert transactions[0].date == expected
+
+
+@pytest.mark.parametrize("document_type", ["MONTHLY_STATEMENT", "TAX_CERTIFICATE"])
+def test_read_freetrade_ignores_document_rows(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    document_type: str,
+) -> None:
+    """Document links in an All Activity export are not transactions."""
+    values = dict.fromkeys(COLUMNS, "")
+    values.update(
+        {
+            FreetradeColumn.TITLE.value: "Account document",
+            FreetradeColumn.TYPE.value: document_type,
+            FreetradeColumn.TIMESTAMP.value: "2024-01-02T10:00:00",
+        }
+    )
+    document_row = [values[column] for column in COLUMNS]
+    path = _write_csv(tmp_path, COLUMNS, [_default_row(), document_row])
+    caplog.set_level(logging.DEBUG, logger="cgt_calc.parsers.freetrade")
+
+    transactions = FreetradeParser().load_from_file(path)
+
+    assert len(transactions) == 1
+    assert transactions[0].action is ActionType.BUY
+    assert (
+        f"Skipping non-transaction Freetrade row 3 ({document_type})" in caplog.messages
+    )
+
+
+def test_read_freetrade_skips_blank_rows(tmp_path: Path) -> None:
+    """Blank, comma-only and space-only lines in an export are not transactions."""
+    blank_row: list[str] = []
+    empty_fields_row = [""] * len(COLUMNS)
+    spaces_row = ["   "]
+    path = _write_csv(
+        tmp_path, COLUMNS, [_default_row(), blank_row, empty_fields_row, spaces_row]
+    )
+
+    transactions = FreetradeParser().load_from_file(path)
+
+    assert len(transactions) == 1
+    assert transactions[0].action is ActionType.BUY
+
+
+@pytest.mark.parametrize(
+    ("buy_sell", "total_amount", "expected_amount"),
+    [
+        ("BUY", "100.75", Decimal("-100.75")),
+        ("SELL", "99.25", Decimal("99.25")),
+    ],
+)
+def test_read_freetrade_trade_uses_account_amount_and_fees(
+    tmp_path: Path,
+    buy_sell: str,
+    total_amount: str,
+    expected_amount: Decimal,
+) -> None:
+    """GBP cash, price, stamp duty and FX fees come from their direct fields."""
+    overrides = {
+        FreetradeColumn.TOTAL_AMOUNT.value: total_amount,
+        FreetradeColumn.BUY_SELL.value: buy_sell,
+        FreetradeColumn.PRICE_PER_SHARE_ACCOUNT.value: "100",
+        FreetradeColumn.STAMP_DUTY.value: "0.50",
+        FreetradeColumn.INSTRUMENT_CURRENCY.value: "USD",
+        FreetradeColumn.TOTAL_SHARES_AMOUNT.value: "125",
+        FreetradeColumn.PRICE_PER_SHARE.value: "125",
+        FreetradeColumn.FX_RATE.value: "1.25",
+        FreetradeColumn.FX_FEE_AMOUNT.value: "0.25",
+    }
+    path = _write_csv(tmp_path, COLUMNS, [_default_row(overrides)])
+
+    transactions = FreetradeParser().load_from_file(path)
+
+    assert len(transactions) == 1
+    transaction = transactions[0]
+    assert transaction.action is (
+        ActionType.BUY if buy_sell == "BUY" else ActionType.SELL
+    )
+    assert transaction.price == Decimal(100)
+    assert transaction.fees == Decimal("0.75")
+    assert transaction.amount == expected_amount
     assert transaction.currency == "GBP"
 
 
-def test_freetrade_transaction_unsupported_action(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_read_freetrade_foreign_dividend_and_withholding_tax(
+    tmp_path: Path,
 ) -> None:
-    """Unsupported action types raise a helpful error."""
+    """Foreign dividend gross income and withholding use GBP-per-unit base FX."""
+    overrides = {
+        FreetradeColumn.TITLE.value: "Nasdaq",
+        FreetradeColumn.TYPE.value: "DIVIDEND",
+        FreetradeColumn.TOTAL_AMOUNT.value: "0.93",
+        FreetradeColumn.BUY_SELL.value: "",
+        FreetradeColumn.TICKER.value: "NDAQ",
+        FreetradeColumn.ISIN.value: "US6311031081",
+        FreetradeColumn.INSTRUMENT_CURRENCY.value: "USD",
+        FreetradeColumn.BASE_FX_RATE.value: "0.78491703",
+        FreetradeColumn.DIVIDEND_GROSS_AMOUNT.value: "1.40",
+        FreetradeColumn.DIVIDEND_NET_AMOUNT.value: "1.19",
+        FreetradeColumn.DIVIDEND_WITHHELD_PERCENTAGE.value: "15",
+        FreetradeColumn.DIVIDEND_WITHHELD_AMOUNT.value: "0.21",
+    }
+    path = _write_csv(tmp_path, COLUMNS, [_default_row(overrides)])
 
-    def fake_action_from_str(action_type: str, buy_sell: str, file: Path) -> ActionType:
-        return ActionType.ADJUSTMENT
+    dividend, tax = FreetradeParser().load_from_file(path)
 
-    monkeypatch.setattr(
-        "cgt_calc.parsers.freetrade._action_from_str", fake_action_from_str
-    )
-    dummy_file = tmp_path / "dummy.csv"
-    dummy_file.write_text("")
-    row = _default_row({FreetradeColumn.TYPE.value: "ADJUSTMENT"})
+    assert dividend.action is ActionType.DIVIDEND
+    assert dividend.amount == Decimal("1.40") * Decimal("0.78491703")
+    assert dividend.currency == "GBP"
+    assert tax.action is ActionType.DIVIDEND_TAX
+    assert tax.amount == Decimal("-0.21") * Decimal("0.78491703")
+    assert tax.currency == "GBP"
+    assert tax.symbol == dividend.symbol
+    assert tax.isin == dividend.isin
 
-    with pytest.raises(
-        UnsupportedBrokerActionError,
-        match="Unsupported Freetrade action 'ADJUSTMENT'",
-    ):
-        FreetradeTransaction(COLUMNS, row, dummy_file)
+
+def test_read_freetrade_transactions_new_header_success(tmp_path: Path) -> None:
+    """Renamed and added columns of the newer export parse like the old ones."""
+    path = _write_csv(tmp_path, NEW_COLUMNS, [_default_new_row()])
+
+    transactions = FreetradeParser().load_from_file(path)
+
+    assert len(transactions) == 1
+    transaction = transactions[0]
+    assert transaction.action is ActionType.BUY
+    assert transaction.symbol == "AAPL"
+    assert transaction.quantity == Decimal(1)
+    assert transaction.price == Decimal(100)
+    assert transaction.amount == Decimal(-100)
+    assert transaction.currency == "GBP"
+    assert transaction.isin == "US0378331005"
+
+
+def test_read_freetrade_transactions_new_header_top_up(tmp_path: Path) -> None:
+    """The renamed account currency amount is read from its new column."""
+    overrides = {
+        FreetradeColumn.TYPE.value: "TOP_UP",
+        FreetradeColumn.TICKER.value: "",
+        RENAMED_COLUMNS[FreetradeColumn.TOTAL_AMOUNT.value]: "150",
+    }
+    path = _write_csv(tmp_path, NEW_COLUMNS, [_default_new_row(overrides)])
+
+    transactions = FreetradeParser().load_from_file(path)
+
+    assert len(transactions) == 1
+    assert transactions[0].action is ActionType.TRANSFER
+    assert transactions[0].amount == Decimal(150)
+
+
+def test_read_freetrade_transactions_new_header_missing_column(tmp_path: Path) -> None:
+    """A renamed column still counts as missing when the export drops it."""
+    dropped = RENAMED_COLUMNS[FreetradeColumn.TOTAL_SHARES_AMOUNT.value]
+    header = [column for column in NEW_COLUMNS if column != dropped]
+    path = _write_csv(tmp_path, header)
+
+    with pytest.raises(ParsingError, match="Missing columns: Total Shares Amount"):
+        FreetradeParser().load_from_file(path)
+
+
+def test_description_reads_as_words_not_python(tmp_path: Path) -> None:
+    """The description interpolates the action, and errors quote it back.
+
+    An enum's default string is its Python name, so this description used to
+    end in `ActionType.BUY` and carried that into every error naming the row.
+    """
+    path = _write_csv(tmp_path, COLUMNS, [_default_row()])
+
+    transaction = FreetradeParser().load_from_file(path)[0]
+
+    assert transaction.description.endswith(" Buy")
+    assert "ActionType" not in str(transaction)

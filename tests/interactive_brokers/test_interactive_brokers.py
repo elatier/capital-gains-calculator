@@ -3,13 +3,20 @@
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-import subprocess
+import re
 
 import pytest
 
-from cgt_calc.model import ActionType, BrokerTransaction
+from cgt_calc.exceptions import ParsingError
+from cgt_calc.model import ActionType, BrokerTransaction, CurrencyCode
 from cgt_calc.parsers.interactive_brokers import InteractiveBrokersParser
-from tests.utils import build_cmd
+from tests.utils import (
+    assert_stdout_matches,
+    build_cmd,
+    report_path,
+    run_cli,
+    stderr_alerts,
+)
 
 
 class TestInteractiveBrokers:
@@ -48,7 +55,7 @@ Transaction History,Header,Date,Account,Description,Transaction Type,Symbol,Quan
     )
 
     def test_single_buy(self, tmp_path: Path) -> None:
-        """Test that bond buy price is divided by 100 for CUSIP symbols."""
+        """Test parsing a single buy transaction."""
         csv_file = tmp_path / "transactions.csv"
         csv_file.write_text(
             self.base_header
@@ -68,7 +75,7 @@ Transaction History,Header,Date,Account,Description,Transaction Type,Symbol,Quan
             price=Decimal("1060.3"),
             fees=Decimal("3.0"),
             amount=Decimal("-1063.3"),
-            currency="GBP",
+            currency=CurrencyCode("GBP"),
             broker="Interactive Brokers",
             isin=None,
         )
@@ -84,62 +91,612 @@ Transaction History,Header,Date,Account,Description,Transaction Type,Symbol,Quan
         assert txn.currency == expected.currency
         assert txn.broker == expected.broker
 
-    def test_buy_foreign_currency_price(self, tmp_path: Path) -> None:
-        """Test that a buy with a foreign-currency price is converted to GBP correctly.
+    def test_header_with_a_trimmed_column_name_shows_the_missing_space(
+        self, tmp_path: Path
+    ) -> None:
+        """The export names a column "Gross Amount ", with a space at its end."""
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(self.base_header.replace("Gross Amount ,", "Gross Amount,"))
+
+        with pytest.raises(
+            ParsingError,
+            match=re.escape("Missing: 'Gross Amount '. Extra: 'Gross Amount'."),
+        ):
+            InteractiveBrokersParser().load_from_file(csv_file)
+
+    def test_isin_is_read_from_the_description(self, tmp_path: Path) -> None:
+        """Dividend rows name the security as TICKER(ISIN); trades do not."""
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header + "Transaction History,Data,2025-10-01,U***08040,"
+            "VT(US9220427424) Cash Dividend USD 0.3272 per Share (Ordinary Dividend),"
+            "Payment in Lieu,VT,-,-,1.0,-,1.0\n"
+            + "Transaction History,Data,2025-10-13,U***08040,"
+            "ISHARES NASDAQ 100 USD ACC,Buy,CNX1,1.0,1060.3,-1060.3,-3.0,-1063.3\n"
+        )
+
+        dividend, trade = InteractiveBrokersParser().load_from_file(csv_file)
+
+        assert dividend.isin == "US9220427424"
+        assert trade.isin is None
+
+    def test_invalid_isin_in_the_description_is_ignored(self, tmp_path: Path) -> None:
+        """A malformed code must not be passed off as an ISIN."""
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header + "Transaction History,Data,2025-10-01,U***08040,"
+            "VT(US9220427429) Cash Dividend USD 0.3272 per Share (Ordinary Dividend),"
+            "Payment in Lieu,VT,-,-,1.0,-,1.0\n"
+        )
+
+        transactions = InteractiveBrokersParser().load_from_file(csv_file)
+
+        assert transactions[0].isin is None
+
+    def test_foreign_currency_price_is_converted_for_a_buy_and_a_sell(
+        self, tmp_path: Path
+    ) -> None:
+        """A trade priced in a foreign currency has its price converted to GBP.
 
         In IBKR exports the Gross/Net Amount and Commission are always in the account's
         base currency (GBP), while Price can be in the instrument's trading currency.
         The parser must convert Price to GBP using the Exchange Rate so that the
         internal consistency check (quantity x price + fees ≈ |amount|) passes.
 
-        Transaction: Buy 217 IWDE at EUR 67.71, exchange rate 0.88542 EUR→GBP.
+        Buy 217 IWDE at EUR 67.71, exchange rate 0.88542 EUR→GBP.
         GBP gross = 217 x 67.71 x 0.88542 = 13009.5380394
         GBP commission = 6.5047690197
         GBP net = 13016.0428084197
+
+        Sell 217 IWDE at EUR 70.00, at the same rate.
+        GBP gross = 217 x 70.00 x 0.88542 = 13449.5298
+        GBP commission = 6.7247649
+        GBP net = 13449.5298 - 6.7247649 = 13442.8050351
         """
         csv_file = tmp_path / "transactions.csv"
         csv_file.write_text(
             self.base_header_with_foreign_currency
             + "Transaction History,Data,2023-02-10,U***9143,ISHARES MSCI WORLD EUR-H,Buy,IWDE,217,67.71,EUR,-13009.5380394,-6.5047690197,-13016.0428084197,0.88542\n"
+            + "Transaction History,Data,2023-03-10,U***9143,ISHARES MSCI WORLD EUR-H,Sell,IWDE,-217,70.00,EUR,13449.5298,-6.7247649,13442.8050351,0.88542\n"
         )
 
-        transactions = InteractiveBrokersParser().load_from_file(csv_file)
+        buy, sell = InteractiveBrokersParser().load_from_file(csv_file)
 
-        assert len(transactions) == 1
-        txn = transactions[0]
-        expected_price_gbp = Decimal("67.71") * Decimal("0.88542")
-        assert txn.date == date(2023, 2, 10)
-        assert txn.action == ActionType.BUY
-        assert txn.symbol == "IWDE"
-        assert txn.quantity == Decimal(217)
-        assert txn.price == expected_price_gbp
-        assert txn.fees == Decimal("6.5047690197")
-        assert txn.amount == Decimal("-13016.0428084197")
-        assert txn.currency == "GBP"
+        assert buy.date == date(2023, 2, 10)
+        assert buy.action == ActionType.BUY
+        assert buy.symbol == "IWDE"
+        assert buy.quantity == Decimal(217)
+        assert buy.price == Decimal("67.71") * Decimal("0.88542")
+        assert buy.fees == Decimal("6.5047690197")
+        assert buy.amount == Decimal("-13016.0428084197")
+        assert buy.currency == "GBP"
 
-    def test_basic_csv_file(self) -> None:
+        assert sell.action == ActionType.SELL
+        assert sell.quantity == Decimal(217)
+        assert sell.price == Decimal("70.00") * Decimal("0.88542")
+        assert sell.fees == Decimal("6.7247649")
+        assert sell.amount == Decimal("13442.8050351")
+        assert sell.currency == "GBP"
+
+    def test_run_with_interactive_brokers_file(
+        self, request: pytest.FixtureRequest
+    ) -> None:
         """Runs the script and verifies it doesn't fail."""
         cmd = build_cmd(
             "--year",
             "2025",
             "--interactive-brokers-file",
             "tests/interactive_brokers/data/test_basic.csv",
+            "--output",
+            report_path(request),
         )
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if result.returncode:
-            pytest.fail(
-                "Integration test failed\n"
-                f"stdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
-            )
-        assert result.stderr == ""
+        result = run_cli(cmd)
+        assert stderr_alerts(result.stderr) == []
         expected_file = (
             Path("tests") / "interactive_brokers" / "data" / "expected_output.txt"
         )
-        expected = expected_file.read_text()
-        cmd_str = " ".join([param if param else "''" for param in cmd])
-        assert result.stdout == expected, (
-            "Run with example files generated unexpected outputs, "
-            "if you added new features update the test with:\n"
-            f"{cmd_str} > {expected_file}"
+        assert_stdout_matches(result, cmd, expected_file)
+
+    def test_ordinary_dividend_and_its_withholding(self, tmp_path: Path) -> None:
+        """An ordinary dividend is income, and the US tax on it is withheld.
+
+        The parser knew "Payment in Lieu", which arrives instead of a dividend
+        when the holding is out on loan, but not the ordinary dividend that
+        every holder of a paying security receives. Anyone with one hit
+        "Unknown type: 'Dividend'" on their first real statement.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header
+            + "Transaction History,Data,2025-11-03,U***00000,VT(US9220427424) Cash Dividend USD 0.50 per Share,Dividend,VT,-,-,20.0,-,20.0\n"
+            + "Transaction History,Data,2025-11-03,U***00000,VT(US9220427424) Cash Dividend - US Tax,Foreign Tax Withholding,VT,-,-,-3.0,-,-3.0\n"
         )
+
+        transactions = InteractiveBrokersParser().load_from_file(csv_file)
+
+        assert [t.action for t in transactions] == [
+            ActionType.DIVIDEND,
+            ActionType.DIVIDEND_TAX,
+        ]
+        assert transactions[0].amount == Decimal("20.0")
+        assert transactions[0].symbol == "VT"
+        assert transactions[1].amount == Decimal("-3.0")
+
+    def test_fx_translation_adjusts_the_balance_only(self, tmp_path: Path) -> None:
+        """Revaluing a currency balance is not a disposal.
+
+        IBKR reports "FX Translations P&L" as an Adjustment. It moves the cash
+        balance and creates no taxable event: exchange movement on a personal
+        currency balance is outside CGT. The Schwab parser treats its own
+        Adjustment the same way.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header
+            + "Transaction History,Data,2025-11-30,U***00000,FX Translations P&L,Adjustment,-,-,-,0.55,-,0.55\n"
+        )
+
+        transactions = InteractiveBrokersParser().load_from_file(csv_file)
+
+        assert len(transactions) == 1
+        assert transactions[0].action == ActionType.ADJUSTMENT
+        assert transactions[0].amount == Decimal("0.55")
+        # No symbol, no quantity and no price, so it cannot become an
+        # acquisition or a disposal however it is grouped downstream. IBKR
+        # writes "-" in all three, and only the numeric columns read that as
+        # absent on their own, so the symbol is pinned here too.
+        assert transactions[0].symbol is None
+        assert transactions[0].quantity is None
+        assert transactions[0].price is None
+
+    def test_debit_interest_adjusts_the_balance_only(self, tmp_path: Path) -> None:
+        """Interest charged on a borrowed balance is a cash move, nothing more.
+
+        IBKR bills it monthly per currency as "Debit Interest", with no
+        symbol. It cannot be a FEE, which adds to a named holding's pooled
+        cost, and netting it against "Credit Interest" would understate the
+        interest received: interest paid on margin is not deductible against
+        it.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header + "Transaction History,Data,2025-10-05,U***00000,"
+            "USD Debit Interest for Sep-2025,Debit Interest,-,-,-,-0.66,-,-0.66\n"
+            + "Transaction History,Data,2025-10-05,U***00000,"
+            "EUR Credit Interest for Sep-2025,Credit Interest,-,-,-,0.80,-,0.80\n"
+        )
+
+        transactions = InteractiveBrokersParser().load_from_file(csv_file)
+
+        assert [t.action for t in transactions] == [
+            ActionType.ADJUSTMENT,
+            ActionType.INTEREST,
+        ]
+        assert [t.amount for t in transactions] == [Decimal("-0.66"), Decimal("0.80")]
+        # No holding behind it, so nothing downstream can read it as a cost.
+        assert transactions[0].symbol is None
+
+    def test_sales_tax_adjusts_the_balance_only(self, tmp_path: Path) -> None:
+        """VAT on an account-level service is not a cost of any security.
+
+        IBKR files the VAT on a market-data subscription under its own
+        "Sales Tax" type, with no symbol, so FEE has nothing to charge it to.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header + "Transaction History,Data,2025-09-04,U***00000,"
+            "VAT on Global Snapshot,Sales Tax,-,-,-,-0.01,-,-0.01\n"
+        )
+
+        transactions = InteractiveBrokersParser().load_from_file(csv_file)
+
+        assert len(transactions) == 1
+        assert transactions[0].action == ActionType.ADJUSTMENT
+        assert transactions[0].amount == Decimal("-0.01")
+        assert transactions[0].symbol is None
+
+    def test_an_other_fee_is_never_part_of_what_a_holding_cost(
+        self, tmp_path: Path
+    ) -> None:
+        """An "Other Fee" leaves the cash balance and adds to no holding's cost.
+
+        IBKR files a market-data subscription and a depositary's ADR fee the
+        same way, the second under the security's symbol. Neither is a cost
+        of acquiring or disposing of the shares (TCGA 1992 s38), so ARM bought
+        for 500 and sold for 600 makes a gain of 100 whatever was charged in
+        between. Read as a cost of the holding, the ADR fee reached the report
+        as a "Cost added to ARM with no new shares" section and took its 0.09
+        off the gain.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header + "Transaction History,Data,2025-09-01,U***00000,"
+            "Electronic Fund Transfer,Deposit,-,-,-,1000.0,-,1000.0\n"
+            + "Transaction History,Data,2025-09-02,U***00000,"
+            "ARM STOCK,Buy,ARM,10.0,50.0,-500.0,-,-500.0\n"
+            + "Transaction History,Data,2025-09-04,U***00000,"
+            "Global Snapshot for Aug 2025,Other Fee,-,-,-,-0.03,-,-0.03\n"
+            + "Transaction History,Data,2025-09-09,U***00000,"
+            "ARM(US0420682058) ADR Fee USD 0.02 per Share,Other Fee,ARM,-,-,-0.09,-,-0.09\n"
+            + "Transaction History,Data,2025-09-10,U***00000,"
+            "ARM STOCK,Sell,ARM,-10.0,60.0,600.0,-,600.0\n"
+        )
+
+        cmd = build_cmd(
+            "--year",
+            "2025",
+            "--interactive-brokers-file",
+            str(csv_file),
+            "--output",
+            str(tmp_path / "out"),
+            keep_tex=True,
+        )
+        result = run_cli(cmd)
+
+        assert stderr_alerts(result.stderr) == []
+        # Both fees leave the cash balance and neither reaches the gain.
+        assert "Final balance\n  Interactive Brokers: 1099.88 (GBP)" in result.stdout
+        assert re.search(r"Allowable costs:\s+£500\.00\n", result.stdout)
+        assert re.search(r"\n  Gain:\s+£100\.00\n", result.stdout)
+        report = (tmp_path / "out.tex").read_text(encoding="utf-8")
+        assert "Cost added to" not in report
+
+    def test_withholding_without_a_security_is_reported_as_interest_tax(
+        self, tmp_path: Path
+    ) -> None:
+        """Tax withheld from cash interest is not dividend tax.
+
+        IBKR names no symbol on it, so there is no holding for a dividend tax
+        row to belong to. Read as one it reaches the report against a holding
+        called "-", and the interest it was taken from is reported with no tax
+        against it.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header + "Transaction History,Data,2025-09-01,U***00000,"
+            "Electronic Fund Transfer,Deposit,-,-,-,1000.0,-,1000.0\n"
+            + "Transaction History,Data,2025-09-30,U***00000,"
+            "GBP Credit Interest for Sep-2025,Credit Interest,-,-,-,13.0,-,13.0\n"
+            + "Transaction History,Data,2025-09-30,U***00000,"
+            "Withholding @ 30% on Credit Interest for Sep-2025,"
+            "Foreign Tax Withholding,-,-,-,-3.9,-,-3.9\n"
+        )
+
+        cmd = build_cmd(
+            "--year",
+            "2025",
+            "--interactive-brokers-file",
+            str(csv_file),
+            "--output",
+            str(tmp_path / "out"),
+        )
+        result = run_cli(cmd)
+
+        assert stderr_alerts(result.stderr) == []
+        assert "Interest taxes\n  Interactive Brokers: 3.90 (GBP)" in result.stdout
+        assert "Tax paid:             £3.90" in result.stdout
+
+    def test_forex_trade_component_is_an_adjustment_not_a_fee(
+        self, tmp_path: Path
+    ) -> None:
+        """A currency conversion is not a charge against a holding.
+
+        IBKR files the base-currency net of an FX trade under the currency
+        pair as a "Forex Trade Component". Its Net Amount is positive when the
+        conversion leaves more base currency behind and negative when it
+        leaves less, and neither direction is a fee: a positive one is refused
+        outright, and a negative one opens a pooled cost for a currency pair.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header + "Transaction History,Data,2025-10-01,U***00000,"
+            "Net Amount in Base from Forex Trade: 800 GBP.USD,"
+            "Forex Trade Component,GBP.USD,800,1.32,0.16,-0.02,0.14\n"
+            + "Transaction History,Data,2025-10-02,U***00000,"
+            "Net Amount in Base from Forex Trade: -800 GBP.USD,"
+            "Forex Trade Component,GBP.USD,-800,1.32,-0.18,-,-0.18\n"
+        )
+
+        transactions = InteractiveBrokersParser().load_from_file(csv_file)
+
+        assert [t.action for t in transactions] == [
+            ActionType.ADJUSTMENT,
+            ActionType.ADJUSTMENT,
+        ]
+        assert [t.amount for t in transactions] == [
+            Decimal("0.14"),
+            Decimal("-0.18"),
+        ]
+        # Neither direction keeps anything that could be read as a security,
+        # and the description still names the pair the movement came from.
+        for component in transactions:
+            assert component.symbol is None
+            assert component.quantity is None
+            assert component.price is None
+            assert component.fees == Decimal(0)
+            assert "GBP.USD" in component.description
+
+    def test_forex_trade_component_moves_the_base_currency_balance(
+        self, tmp_path: Path
+    ) -> None:
+        """Net Amount is in the base currency whatever priced the leg.
+
+        In the extended format a currency-pair row can name a Price Currency,
+        and the price is converted to GBP only when the row also carries an
+        Exchange Rate. Without one the price stays foreign, and taking that as
+        the transaction currency would file a GBP Net Amount against a USD
+        balance instead.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header_with_foreign_currency
+            + "Transaction History,Data,2025-10-02,U***00000,"
+            "Net Amount in Base from Forex Trade: 800 GBP.USD,"
+            "Forex Trade Component,GBP.USD,800,1.32,USD,0.18,-,0.18,-\n"
+        )
+
+        transactions = InteractiveBrokersParser().load_from_file(csv_file)
+
+        assert len(transactions) == 1
+        assert transactions[0].action == ActionType.ADJUSTMENT
+        assert transactions[0].currency == CurrencyCode("GBP")
+        assert transactions[0].amount == Decimal("0.18")
+
+    @pytest.mark.parametrize("exchange_rate", ["-", "1.32"])
+    def test_priced_row_without_a_price_records_the_base_currency_amount(
+        self, tmp_path: Path, exchange_rate: str
+    ) -> None:
+        """Price Currency describes the price, not the Net Amount.
+
+        A dividend row can name the currency the security trades in while
+        stating no price of its own, with or without an Exchange Rate. Net
+        Amount is in the account's base currency either way, so the
+        transaction is in GBP and nothing is left to convert.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header_with_foreign_currency
+            + "Transaction History,Data,2025-10-02,U***00000,"
+            "VT(US9220427424) Cash Dividend,Dividend,VT,-,-,USD,100.0,-,100.0,"
+            f"{exchange_rate}\n"
+        )
+
+        transactions = InteractiveBrokersParser().load_from_file(csv_file)
+
+        assert len(transactions) == 1
+        assert transactions[0].currency == CurrencyCode("GBP")
+        assert transactions[0].amount == Decimal("100.0")
+        assert transactions[0].price is None
+
+    def test_dividend_priced_in_a_foreign_currency_is_not_converted(
+        self, tmp_path: Path
+    ) -> None:
+        """A base-currency dividend must not be reported in the price currency.
+
+        Taking Price Currency as the transaction currency filed a GBP 100
+        dividend as USD 100, moved a USD balance the account never held and
+        converted the proceeds down to about GBP 73.
+
+        The row states a price as well and no rate to convert it with. Only
+        a Buy or Sell has its price read back, so the dividend is not refused
+        over one.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header_with_foreign_currency
+            + "Transaction History,Data,2025-01-01,U***00000,"
+            "Electronic Fund Transfer,Deposit,-,-,-,-,1000.0,-,1000.0,-\n"
+            + "Transaction History,Data,2025-10-02,U***00000,"
+            "VT(US9220427424) Cash Dividend,Dividend,VT,-,0.50,USD,100.0,-,100.0,-\n"
+        )
+
+        cmd = build_cmd(
+            "--year",
+            "2025",
+            "--interactive-brokers-file",
+            str(csv_file),
+            "--output",
+            str(tmp_path / "out"),
+        )
+        result = run_cli(cmd)
+        assert stderr_alerts(result.stderr) == []
+        assert "(USD)" not in result.stdout
+        assert "Final balance\n  Interactive Brokers: 1100.00 (GBP)" in result.stdout
+        assert "VT: 100.00 (GBP)" in result.stdout
+        assert re.search(r"Proceeds:\s+£100\.00", result.stdout)
+
+    def test_foreign_price_without_an_exchange_rate_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """A price nothing can convert cannot be checked against the amount.
+
+        The amount columns are in GBP, so a EUR price with no Exchange Rate
+        would fail the quantity x price + fees check anyway. Say why instead
+        of guessing a rate or dropping the price.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header_with_foreign_currency
+            + "Transaction History,Data,2023-02-10,U***9143,"
+            "ISHARES MSCI WORLD EUR-H,Buy,IWDE,217,67.71,EUR,"
+            "-13009.5380394,-6.5047690197,-13016.0428084197,-\n"
+        )
+
+        with pytest.raises(ParsingError) as excinfo:
+            InteractiveBrokersParser().load_from_file(csv_file)
+
+        assert "Price is in EUR" in str(excinfo.value)
+        assert "Exchange Rate" in str(excinfo.value)
+
+    def test_foreign_price_without_an_exchange_rate_column_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """Price Currency and Exchange Rate are independent optional columns.
+
+        A header can carry the first and not the second. Reading the missing
+        column as a 1:1 rate would pass a EUR price off as a GBP one, so such
+        a row is refused just like one whose Exchange Rate is empty.
+        """
+        header = self.base_header_with_foreign_currency.replace(
+            ",Exchange Rate\n", "\n"
+        )
+        assert "Exchange Rate" not in header
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            header + "Transaction History,Data,2023-02-10,U***9143,"
+            "ISHARES MSCI WORLD EUR-H,Buy,IWDE,217,67.71,EUR,"
+            "-13009.5380394,-6.5047690197,-13016.0428084197\n"
+        )
+
+        with pytest.raises(ParsingError) as excinfo:
+            InteractiveBrokersParser().load_from_file(csv_file)
+
+        assert "Price is in EUR" in str(excinfo.value)
+        assert "Exchange Rate" in str(excinfo.value)
+
+    def test_forex_trade_component_leaves_no_fee_in_the_report(
+        self, tmp_path: Path
+    ) -> None:
+        """A currency pair must not reach the report as a holding with a cost.
+
+        The pooled cost a fee opens is invisible in the printed summary while
+        the quantity is zero, so the rendered report is what gives it away: on
+        the fee path this file produces a "Cost added to GBP.USD with no new
+        shares" section for a symbol that is not a security.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header + "Transaction History,Data,2025-01-01,U***00000,"
+            "Electronic Fund Transfer,Deposit,-,-,-,1000.0,-,1000.0\n"
+            + "Transaction History,Data,2025-10-02,U***00000,"
+            "Net Amount in Base from Forex Trade: -800 GBP.USD,"
+            "Forex Trade Component,GBP.USD,-800,1.32,-0.18,-,-0.18\n"
+        )
+
+        cmd = build_cmd(
+            "--year",
+            "2025",
+            "--interactive-brokers-file",
+            str(csv_file),
+            "--output",
+            str(tmp_path / "out"),
+            keep_tex=True,
+        )
+        result = run_cli(cmd)
+        assert stderr_alerts(result.stderr) == []
+        assert "Final balance\n  Interactive Brokers: 999.82 (GBP)" in result.stdout
+        assert "GBP.USD" not in (tmp_path / "out.tex").read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize(
+        ("rows", "balance"),
+        [
+            pytest.param(
+                # Bought, sold and bought back, as the export that reported the
+                # problem lists it.
+                "Transaction History,Data,2025-06-02,U***00000,AAA STOCK,Buy,AAA,10.0,100.0,-1000.0,-,-1000.0\n"
+                "Transaction History,Data,2025-06-02,U***00000,AAA STOCK,Sell,AAA,-10.0,110.0,1100.0,-,1100.0\n"
+                "Transaction History,Data,2025-06-02,U***00000,AAA STOCK,Buy,AAA,10.0,110.0,-1100.0,-,-1100.0\n",
+                "0.00",
+                id="buy-sell-buy",
+            ),
+            pytest.param(
+                # Bought and then sold, listed newest first.
+                "Transaction History,Data,2025-06-02,U***00000,AAA STOCK,Sell,AAA,-10.0,110.0,1100.0,-,1100.0\n"
+                "Transaction History,Data,2025-06-02,U***00000,AAA STOCK,Buy,AAA,10.0,100.0,-1000.0,-,-1000.0\n",
+                "1100.00",
+                id="sale-listed-before-its-purchase",
+            ),
+            pytest.param(
+                # A holding and no cash, sold and bought straight back.
+                "Transaction History,Data,2025-01-01,U***00000,AAA STOCK,Buy,AAA,10.0,100.0,-1000.0,-,-1000.0\n"
+                "Transaction History,Data,2025-06-02,U***00000,AAA STOCK,Sell,AAA,-10.0,110.0,1100.0,-,1100.0\n"
+                "Transaction History,Data,2025-06-02,U***00000,AAA STOCK,Buy,AAA,10.0,110.0,-1100.0,-,-1100.0\n",
+                "0.00",
+                id="holding-sold-to-buy-it-back",
+            ),
+        ],
+    )
+    def test_same_day_trades_in_one_security_are_accepted(
+        self, tmp_path: Path, rows: str, balance: str
+    ) -> None:
+        """A security traded both ways on one day passes in any listed order.
+
+        IBKR can list a day's rows newest first, so a purchase followed by a
+        sale may arrive sale first. Read in that order, the sale would meet an
+        empty holding and be refused as not owned, so a day's sales are read
+        after its purchases. Selling a holding from a zero cash balance to buy
+        it straight back passes too, because cash is checked at the end of the
+        day.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header
+            + "Transaction History,Data,2025-01-01,U***00000,Electronic Fund Transfer,Deposit,-,-,-,1000.0,-,1000.0\n"
+            + rows
+        )
+
+        cmd = build_cmd(
+            "--year",
+            "2025",
+            "--interactive-brokers-file",
+            str(csv_file),
+            "--output",
+            str(tmp_path / "out"),
+        )
+        result = run_cli(cmd)
+        assert stderr_alerts(result.stderr) == []
+        assert f"Final balance\n  Interactive Brokers: {balance} (GBP)" in result.stdout
+
+    @pytest.mark.parametrize(
+        "cache", [None, "ISIN,symbol\nDE0007030009,RHM\n"], ids=["no-cache", "cache"]
+    )
+    def test_exchange_alias_pools_trades_named_only_by_a_dividend(
+        self, tmp_path: Path, cache: str | None
+    ) -> None:
+        """Trades under an alias join the holding the dividends identify.
+
+        IBKR names the security by ISIN on a dividend row but not on a trade
+        row, so the RHMd buy and sell carry no ISIN of their own and the
+        alias table cannot reach them on its own. Left split, the five shares
+        sold take their cost from the RHMd purchase alone: GBP 1,000 rather
+        than the GBP 750 the pooled holding gives them.
+
+        The buys come before the dividends that name them, so the identity
+        has to be read across the whole export rather than as each row
+        arrives. A cache row listing only RHM must not restore the split
+        either.
+        """
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            self.base_header
+            + "Transaction History,Data,2024-01-01,U***00000,Electronic Fund Transfer,Deposit,-,-,-,3000.0,-,3000.0\n"
+            + "Transaction History,Data,2024-01-02,U***00000,RHEINMETALL AG,Buy,RHM,10.0,100.0,-1000.0,-,-1000.0\n"
+            + "Transaction History,Data,2024-02-02,U***00000,RHEINMETALL AG,Buy,RHMd,10.0,200.0,-2000.0,-,-2000.0\n"
+            + "Transaction History,Data,2024-06-03,U***00000,"
+            "RHM(DE0007030009) Cash Dividend GBP 1.00 per Share (Ordinary Dividend),"
+            "Dividend,RHM,-,-,10.0,-,10.0\n"
+            + "Transaction History,Data,2024-06-03,U***00000,"
+            "RHM(DE0007030009) Cash Dividend GBP 1.00 per Share (Ordinary Dividend),"
+            "Dividend,RHMd,-,-,10.0,-,10.0\n"
+            + "Transaction History,Data,2025-06-02,U***00000,RHEINMETALL AG,Sell,RHMd,-5.0,300.0,1500.0,-,1500.0\n"
+        )
+
+        cmd = build_cmd(
+            "--year",
+            "2025",
+            "--interactive-brokers-file",
+            str(csv_file),
+            "--output",
+            str(tmp_path / "out"),
+        )
+        if cache is not None:
+            cache_file = tmp_path / "isin.csv"
+            cache_file.write_text(cache)
+            cmd += ["--isin-translation-file", str(cache_file)]
+
+        result = run_cli(cmd)
+        assert stderr_alerts(result.stderr) == []
+        assert "RHMd" not in result.stdout
+        assert "RHM: 15.00, £2,250.00" in result.stdout
+        assert re.search(r"Allowable costs:\s+£750\.00", result.stdout)
+        assert re.search(r"Total gain:\s+£750\.00", result.stdout)

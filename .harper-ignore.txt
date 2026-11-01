@@ -1,0 +1,107 @@
+# Harper lints accepted in this repository, one extended regex per line,
+# matched against `harper lint --format compact` output lines.
+# Use this only for words the dictionary cannot whitelist: Harper's base
+# dictionary dialect-gates US spellings, so they stay flagged under
+# --dialect gb even when added to .harper-dictionary.txt.
+
+# "Equity Award Center" is Schwab's product name.
+^schwab_equity_award_json\.py:.*`Center`
+# NO_COLOR is a standard environment variable (https://no-color.org/).
+^logging\.py:.*`COLOR`
+# "a share that fell that far" is correct; the FeelFell typo rule misfires.
+^schwab\.md:.*FeelFell
+# "Section 106A" - Harper reads the trailing "A" as an indefinite article.
+^raw\.md:.*AnA
+# "without giving you new shares" is correct; the PronounKnew rule reads
+# "you new" as a slip for "you knew".
+^raw\.md:.*PronounKnew
+# An example commit hash in a comment about `git describe` output.
+^version\.py:.*`g3473d67`
+# "a backup tag" is a compound noun; Harper reads it as the verb "back up".
+^version\.py:.*PhrasalVerbAsCompoundNoun
+# "A fee on the row is real money" is complete; MissingPreposition misfires.
+^ingestion\.py:.*MissingPreposition
+# "CR CR LF" spells out the doubled carriage return; the repeat is the point.
+^util\.py:.*RepeatedWords
+# "a header that does not match" is a relative clause, not a comparison.
+^vanguard\.md:.*ThatThan
+# "What a lot does state" - a lot here is a parcel of shares, not the
+# quantifier "a lot of".
+^schwab_equity_award_json\.py:.*QuantifierNeedsOf
+# "every source row and its ordering" is possessive, not a contraction.
+^stock_split_planning\.py:.*ItsContraction
+# "all its verified tickers" is possessive, not a contraction.
+^interactive-brokers\.md:.*ItsContraction
+# "lists under its known limitations" - the page's limitations, a possessive.
+^trading212\.py:.*ItsContraction
+# "the rows that preceded it are already in the units it leaves behind"
+# already agrees; PronounInflectionBe reads the wrong subject.
+^matching\.py:.*PronounInflectionBe
+# "nothing earlier that day" is a time reference, not a comparison.
+^stock_splits\.py:.*ThatThan
+# "a very small holding" is a shareholding, not a smallholding.
+^trading212\.md:.*CompoundNouns
+# "Trading 212's timestamp" is possessive; Harper reads the digits as the
+# end of a sentence and the "s" as a word of its own.
+^trading212\.py:.*`s`
+# The ISIN in the comment on the exchange-alias table, naming the security
+# whose ticker code the sentence is about.
+^const\.py:.*`US67066G1040`
+# "True on every one of them" counts the rows one at a time; Harper reads it
+# as the closed compound "everyone".
+^model\.py:.*Everyone
+# "every one of those decisions" is two words; the Everyone rule misfires.
+^report_view\.py:.*Everyone
+# "every one of them is claimed by both ends" counts the names one at a time;
+# the Everyone rule misfires.
+^ingestion\.py:.*Everyone
+# "has taken every one of them" counts the day's shares one at a time; the
+# Everyone rule misfires.
+^matching\.py:.*Everyone
+# "how many candidates there are" is correct; ThereIsAgreement expects the noun
+# after the verb, but this construction puts it first.
+^trading212\.py:.*ThereIsAgreement
+# "Either layout of the price-only export" is a compound noun; Harper
+# reads it as the verb "lay out".
+^schwab\.md:.*PhrasalVerbAsCompoundNoun
+# "a single hop" is the graph sense, as in this file's own `_one_hop_renames`.
+^rename_planning\.py:.*HopHope
+# "at least three to list" is the ordinary quantifier; the
+# QuantifierNumeralConflict rule expects the two to disagree.
+^matching\.py:.*QuantifierNumeralConflict
+# Fragments of L&G's published report file names, quoted in a comment.
+^legal_and_general\.py:.*`(ucits|etf|ukrfs)`
+# The start of Vanguard's published report file names, quoted in a comment.
+^vanguard\.py:.*`vis`
+# "a layout change" is a compound noun; Harper reads it as the verb "lay out".
+^legal_and_general\.py:.*PhrasalVerbAsCompoundNoun
+# "Your tax is" - Harper joins "tax is" into the noun "taxis".
+^tax-estimates\.md:.*CompoundNouns.*taxis
+# "a file path" is the ordinary open compound; Harper prefers "filepath".
+^usage\.md:.*CompoundNouns.*filepath
+# "all of the gain" is ordinary English; the shorter form is only a preference.
+^(tax-estimates\.md|render_text\.py):.*CondenseAllThe
+# "reminds you when the report has such dividends" is complete as it stands.
+^tax-estimates\.md:.*MissingPreposition
+# "a wrong guess changes the income a thousandfold" is complete as it stands.
+^args_validators\.py:.*MissingPreposition
+# "Trading 212's" - Harper splits the possessive after a number.
+^trading212\.md:.*SpellCheck.*`s`
+# '-.tex' is the LaTeX source file `--output -` would have created.
+^args_validators\.py:.*`tex`
+# "The others are minor currencies" is complete; MissingPreposition misfires.
+^extra-data-and-options\.md:.*MissingPreposition
+# "the Georgian lari at the rouble's rate" - Harper joins "lari at" into "lariat".
+^extra-data-and-options\.md:.*MergeWords
+# The ticker SAEM, in the comment that stops codespell rewriting it as "SAME".
+^const\.py:.*SpellCheck.*`saem`
+# "a trade earlier that day" is a time, not a comparison with "than".
+^trading212\.md:.*ThatThan
+# "file system" as two words is standard; CompoundNouns wants "filesystem".
+^mssb\.py:.*CompoundNouns.*filesystem
+# "insert ... as a new line" is a line added to the file, not a "newline".
+^(hargreaves-lansdown|sharesight)\.md:.*CompoundNouns.*newline
+# "one of the London fund tickers" has its plural noun; OneOfTheSingular misfires.
+^schwab\.md:.*OneOfTheSingular
+# "a narrow and a wide screen" describes screen widths, not the widescreen format.
+^contributing\.md:.*CompoundNouns.*widescreen

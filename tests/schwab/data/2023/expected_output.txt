@@ -1,26 +1,37 @@
-Parsing tests/schwab/data/2023/transactions.csv...
-Found 7 broker transactions
-First pass completed
-Final portfolio:
-Final balance:
+Final portfolio
+  (none)
+
+Final balance
   Charles Schwab: 1019826.86 (USD)
-Disposal proceeds: £248082.51
 
-Second pass completed
-Portfolio at the end of 2023/2024 tax year:
-For tax year 2023/2024:
-Number of disposals: 3
-Disposal proceeds: £248082.51
-Allowable costs: £232740.33
-Capital gain: £15342.18
-Capital loss: £0.00
-Total capital gain: £15342.18
-Taxable capital gain: £9342.18
-Total dividends proceeds: £0.00
-Total amount of dividends tax yearly allowance: £1000.00
-Total taxable dividends proceeds: £0.00
-Total UK interest proceeds: £0.00
-Total foreign interest proceeds: £0.00
+Portfolio at the end of 2023/2024 tax year
+  (none)
 
-Generating PDF report...
-All done!
+Tax summary for 2023/2024
+
+Capital gains
+  Disposals:                    3
+  Disposal proceeds:  £248,082.51
+  Allowable costs:    £232,740.33
+  Gain:                £15,342.18
+  Loss:                     £0.00
+  Total gain:          £15,342.18
+  Taxable gain:         £9,342.18
+  Tax at basic rate:      £934.22
+  Tax at higher rate:   £1,868.44
+Basic rate (10%): your taxable income for 2023/2024 plus the taxable gain is £37,700 or less.
+Higher rate (20%): your taxable income for 2023/2024 is £37,700 or more.
+If your taxable income is under £37,700 but the taxable gain takes you over it, you pay the basic rate on the part of it that fits under £37,700 and the higher rate on the rest. Your tax is then between the two figures.
+Taxable income is your income after the Personal Allowance and other Income Tax reliefs.
+To get a single figure, add --income with your income for 2023/2024 before the Personal Allowance, such as the pay on your P60. cgt-calc adds the dividends and interest in these files.
+The tax is an estimate: it leaves out gains that are not in the files you supplied, losses brought forward and reliefs. See https://cgt-calc.uk/tax-estimates/#what-the-estimates-leave-out
+
+Dividends
+  Proceeds:                 £0.00
+  Tax-free allowance:   £1,000.00
+  Taxable proceeds:         £0.00
+
+Interest
+  UK proceeds:              £0.00
+  Foreign proceeds:         £0.00
+  Tax paid:                 £0.00

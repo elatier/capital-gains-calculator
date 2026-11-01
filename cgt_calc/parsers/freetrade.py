@@ -2,21 +2,28 @@
 
 from __future__ import annotations
 
-import csv
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from datetime import UTC, datetime
+from decimal import Decimal
 from enum import StrEnum
 import logging
-from typing import TYPE_CHECKING, ClassVar, Final, TextIO
+from typing import TYPE_CHECKING, ClassVar, Final, TextIO, override
 
+from cgt_calc.const import UK_TIMEZONE
 from cgt_calc.exceptions import (
     ParsingError,
-    UnsupportedBrokerActionError,
+    UnexpectedColumnCountError,
     UnsupportedBrokerCurrencyError,
 )
-from cgt_calc.model import ActionType, BrokerTransaction
+from cgt_calc.model import (
+    ActionType,
+    BrokerTransaction,
+    CurrencyCode,
+    Isin,
+    TransactionSource,
+)
+from cgt_calc.util import is_blank_row, parse_decimal
 
-from .base_parsers import BaseSingleFileParser
+from .base_parsers import BaseSingleFileParser, read_csv_rows
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -62,16 +69,46 @@ class FreetradeColumn(StrEnum):
 COLUMNS: Final[list[str]] = [column.value for column in FreetradeColumn]
 REQUIRED_COLUMNS: Final[set[str]] = set(COLUMNS)
 
+# Freetrade renamed these columns, older exports still use the names above.
+COLUMN_ALIASES: Final[dict[str, str]] = {
+    "Total Amount in Account Currency": FreetradeColumn.TOTAL_AMOUNT.value,
+    "Total Amount in Instrument Currency": FreetradeColumn.TOTAL_SHARES_AMOUNT.value,
+}
+
+# Newer exports add a block of stock split columns. They are tolerated so that
+# the header validates, their values are not read yet: a stock split row still
+# fails as an unknown type.
+STOCK_SPLIT_PREFIX: Final = "Stock Split "
+
+# These Activity Feed rows point to documents rather than cash or security
+# transactions. Freetrade includes them in an All Activity export.
+IGNORED_TYPES: Final[frozenset[str]] = frozenset(
+    {"MONTHLY_STATEMENT", "TAX_CERTIFICATE"}
+)
+
 
 def _parse_decimal(row: dict[str, str], column: FreetradeColumn) -> Decimal:
     """Parse Decimal value for column, raising ValueError with context on failure."""
-    value = row[column]
-    try:
-        return Decimal(value)
-    except InvalidOperation as err:
-        raise ValueError(
-            f"Invalid decimal in column '{column.value}': {value!r}"
-        ) from err
+    return parse_decimal(row[column], f"column '{column.value}'")
+
+
+def _parse_optional_decimal(row: dict[str, str], column: FreetradeColumn) -> Decimal:
+    """Parse a decimal that Freetrade leaves blank when it does not apply."""
+    if row[column] == "":
+        return Decimal(0)
+    return _parse_decimal(row, column)
+
+
+def _dividend_amount_in_gbp(row: dict[str, str], column: FreetradeColumn) -> Decimal:
+    """Convert a dividend field from instrument currency to account currency."""
+    amount = _parse_decimal(row, column)
+    if amount != 0:
+        instrument_currency = CurrencyCode(row[FreetradeColumn.INSTRUMENT_CURRENCY])
+        if instrument_currency != "GBP":
+            # Dividend exports express Base FX Rate as GBP per unit of the
+            # instrument currency (unlike the trade-only FX Rate column).
+            amount *= _parse_decimal(row, FreetradeColumn.BASE_FX_RATE)
+    return amount
 
 
 def _action_from_str(action_type: str, buy_sell: str, file: Path) -> ActionType:
@@ -80,9 +117,9 @@ def _action_from_str(action_type: str, buy_sell: str, file: Path) -> ActionType:
         return ActionType.INTEREST
     if action_type == "DIVIDEND":
         return ActionType.DIVIDEND
-    if action_type in ["TOP_UP", "WITHDRAWAL"]:
+    if action_type in {"TOP_UP", "WITHDRAWAL"}:
         return ActionType.TRANSFER
-    if action_type in ["ORDER", "FREESHARE_ORDER"]:
+    if action_type in {"ORDER", "FREESHARE_ORDER"}:
         if buy_sell == "BUY":
             return ActionType.BUY
         if buy_sell == "SELL":
@@ -96,9 +133,8 @@ def _action_from_str(action_type: str, buy_sell: str, file: Path) -> ActionType:
 class FreetradeTransaction(BrokerTransaction):
     """Represents a single Freetrade transaction."""
 
-    def __init__(self, header: list[str], row_raw: list[str], file: Path) -> None:
-        """Create transaction from CSV row."""
-        row = dict(zip(header, row_raw, strict=False))
+    def __init__(self, row: dict[str, str], file: Path) -> None:
+        """Create transaction from a CSV row keyed by column name."""
         action = _action_from_str(
             row[FreetradeColumn.TYPE], row[FreetradeColumn.BUY_SELL], file
         )
@@ -106,70 +142,110 @@ class FreetradeTransaction(BrokerTransaction):
         symbol = (
             row[FreetradeColumn.TICKER] if row[FreetradeColumn.TICKER] != "" else None
         )
-        if symbol is None and action not in [ActionType.TRANSFER, ActionType.INTEREST]:
+        if symbol is None and action not in {ActionType.TRANSFER, ActionType.INTEREST}:
             raise ParsingError(file, f"No symbol for action: {action}")
 
-        # I believe GIA account at Freetrade can be only in GBP
+        # The importer and calculation path below use the exported GBP account
+        # currency fields. Reject another account currency rather than
+        # silently treating it as sterling.
         if row[FreetradeColumn.ACCOUNT_CURRENCY] != "GBP":
             raise UnsupportedBrokerCurrencyError(
                 file, BROKER_NAME, row[FreetradeColumn.ACCOUNT_CURRENCY]
             )
 
-        # Convert all numbers in GBP using Freetrade rates
-        if action in [ActionType.SELL, ActionType.BUY]:
+        fees = Decimal(0)
+        if action in {ActionType.SELL, ActionType.BUY}:
             quantity = _parse_decimal(row, FreetradeColumn.QUANTITY)
-            price = _parse_decimal(row, FreetradeColumn.PRICE_PER_SHARE)
-            amount = _parse_decimal(row, FreetradeColumn.TOTAL_SHARES_AMOUNT)
-            currency = row[FreetradeColumn.INSTRUMENT_CURRENCY]
-            if currency != "GBP":
-                fx_rate = _parse_decimal(row, FreetradeColumn.FX_RATE)
-                price /= fx_rate
-                amount /= fx_rate
-            currency = "GBP"
+            # These two fields are already in account currency. Total Amount
+            # is the cash movement after fees, while the account-currency unit
+            # price excludes them, so retaining the exported fee fields keeps
+            # all three values mutually consistent.
+            price = _parse_decimal(row, FreetradeColumn.PRICE_PER_SHARE_ACCOUNT)
+            amount = _parse_decimal(row, FreetradeColumn.TOTAL_AMOUNT)
+            fees = _parse_optional_decimal(
+                row, FreetradeColumn.STAMP_DUTY
+            ) + _parse_optional_decimal(row, FreetradeColumn.FX_FEE_AMOUNT)
+            currency = CurrencyCode("GBP")
         elif action == ActionType.DIVIDEND:
-            # Total amount before US tax withholding
-            amount = _parse_decimal(row, FreetradeColumn.DIVIDEND_GROSS_AMOUNT)
+            amount = _dividend_amount_in_gbp(row, FreetradeColumn.DIVIDEND_GROSS_AMOUNT)
             quantity, price = None, None
-            currency = row[FreetradeColumn.INSTRUMENT_CURRENCY]
-            if currency != "GBP":
-                # FX Rate is not defined for dividends,
-                # but we can use base one as there's no fee
-                amount /= _parse_decimal(row, FreetradeColumn.BASE_FX_RATE)
-            currency = "GBP"
-        elif action in [ActionType.TRANSFER, ActionType.INTEREST]:
+            currency = CurrencyCode("GBP")
+        elif action in {ActionType.TRANSFER, ActionType.INTEREST}:
             amount = _parse_decimal(row, FreetradeColumn.TOTAL_AMOUNT)
             quantity, price = None, None
-            currency = "GBP"
+            currency = CurrencyCode("GBP")
         else:
-            raise UnsupportedBrokerActionError(
-                file, BROKER_NAME, row[FreetradeColumn.TYPE]
-            )
+            # _action_from_str refuses every other type, so only an action it
+            # learns to return without a branch here can reach this.
+            raise AssertionError(f"no branch for {action}")
 
         if row[FreetradeColumn.TYPE] == "FREESHARE_ORDER":
             price = Decimal(0)
             amount = Decimal(0)
+            fees = Decimal(0)
 
         amount_negative = (
             action == ActionType.BUY or row[FreetradeColumn.TYPE] == "WITHDRAWAL"
         )
-        if amount is not None and amount_negative:
+        if amount_negative:
             amount *= -1
 
+        isin_raw = row.get(FreetradeColumn.ISIN)
+        isin = Isin(isin_raw) if isin_raw else None
+
+        # The timestamp is in UTC, but the date that drives the tax year and
+        # the matching rules is the UK one.
+        timestamp = datetime.fromisoformat(row[FreetradeColumn.TIMESTAMP])
+        if timestamp.tzinfo is None:
+            # The export states its times in UTC, so a value without a zone
+            # is read as UTC too rather than as the machine's local time.
+            timestamp = timestamp.replace(tzinfo=UTC)
+        self.datetime = timestamp
+
         super().__init__(
-            date=datetime.fromisoformat(row[FreetradeColumn.TIMESTAMP]).date(),
+            date=timestamp.astimezone(UK_TIMEZONE).date(),
             action=action,
             symbol=symbol,
             description=f"{row[FreetradeColumn.TITLE]} {action}",
             quantity=quantity,
             price=price,
-            fees=Decimal(0),  # not implemented
+            fees=fees,
             amount=amount,
             currency=currency,
             broker=BROKER_NAME,
+            isin=isin,
         )
 
 
-class FreetradeParser(BaseSingleFileParser):
+def _dividend_tax_transaction(
+    transaction: FreetradeTransaction, row: dict[str, str]
+) -> BrokerTransaction | None:
+    """Create the tax-at-source cash movement carried on a dividend row."""
+    if transaction.action is not ActionType.DIVIDEND:
+        return None
+
+    if row[FreetradeColumn.DIVIDEND_WITHHELD_AMOUNT] == "":
+        return None
+    amount = _dividend_amount_in_gbp(row, FreetradeColumn.DIVIDEND_WITHHELD_AMOUNT)
+    if amount == 0:
+        return None
+
+    return BrokerTransaction(
+        date=transaction.date,
+        action=ActionType.DIVIDEND_TAX,
+        symbol=transaction.symbol,
+        description=f"{row[FreetradeColumn.TITLE]} {ActionType.DIVIDEND_TAX}",
+        quantity=None,
+        price=None,
+        fees=Decimal(0),
+        amount=-amount,
+        currency=CurrencyCode("GBP"),
+        broker=BROKER_NAME,
+        isin=transaction.isin,
+    )
+
+
+class FreetradeParser(BaseSingleFileParser[BrokerTransaction]):
     """Parser for Freetrade transaction files."""
 
     arg_name = "freetrade"
@@ -178,24 +254,54 @@ class FreetradeParser(BaseSingleFileParser):
     deprecated_flags: ClassVar[list[str]] = ["--freetrade"]
 
     @classmethod
+    @override
     def read_transactions(
         cls, file: TextIO, file_path: Path
     ) -> list[BrokerTransaction]:
         """Parse Freetrade transactions from a CSV file."""
-        lines = list(csv.reader(file))
+        lines = read_csv_rows(file, file_path)
         if not lines:
             raise ParsingError(file_path, "Freetrade CSV file is empty")
-        header = lines[0]
+        header = [COLUMN_ALIASES.get(column, column) for column in lines[0]]
         cls._validate_header(header, file_path)
         lines = lines[1:]
         indexed_rows = list(enumerate(lines, start=2))
-        # HACK: reverse transactions to avoid negative balance issues
-        # the proper fix would be to use datetime in BrokerTransaction
+        # Freetrade lists the newest row first. Reversed, a sale is read after
+        # the purchase it draws on.
         indexed_rows.reverse()
         transactions: list[BrokerTransaction] = []
-        for index, row in indexed_rows:
+        for index, row_raw in indexed_rows:
+            # Exports may end with a blank line, which csv reads as an
+            # empty row rather than a transaction.
+            if is_blank_row(row_raw):
+                continue
+            # A short row would be read with columns missing, and a long
+            # one with its last cells dropped.
+            if len(row_raw) != len(header):
+                raise UnexpectedColumnCountError(
+                    row_raw, len(header), file_path, row_index=index
+                )
+            row = dict(zip(header, row_raw, strict=True))
+            action_type = row.get(FreetradeColumn.TYPE)
+            if action_type in IGNORED_TYPES:
+                LOGGER.debug(
+                    "Skipping non-transaction Freetrade row %d (%s)",
+                    index,
+                    action_type,
+                )
+                continue
             try:
-                transactions.append(FreetradeTransaction(header, row, file_path))
+                transaction = FreetradeTransaction(row, file_path)
+                transaction.source = TransactionSource(
+                    row=index, timestamp=transaction.datetime
+                )
+                transactions.append(transaction)
+                dividend_tax = _dividend_tax_transaction(transaction, row)
+                if dividend_tax is not None:
+                    dividend_tax.source = TransactionSource(
+                        row=index, timestamp=transaction.datetime
+                    )
+                    transactions.append(dividend_tax)
             except ParsingError as err:
                 err.add_row_context(index)
                 raise
@@ -210,9 +316,13 @@ class FreetradeParser(BaseSingleFileParser):
         missing = REQUIRED_COLUMNS - provided
         if missing:
             missing_columns = ", ".join(sorted(missing))
-            raise ParsingError(file, f"Missing columns: {missing_columns}")
+            raise ParsingError(file, f"Missing columns: {missing_columns}", row_index=1)
 
-        unknown = provided - REQUIRED_COLUMNS
+        unknown = {
+            column
+            for column in provided - REQUIRED_COLUMNS
+            if not column.startswith(STOCK_SPLIT_PREFIX)
+        }
         if unknown:
             unknown_columns = ", ".join(sorted(unknown))
-            raise ParsingError(file, f"Unknown columns: {unknown_columns}")
+            raise ParsingError(file, f"Unknown columns: {unknown_columns}", row_index=1)
